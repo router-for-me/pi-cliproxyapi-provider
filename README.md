@@ -1,6 +1,6 @@
 # pi-cliproxyapi-provider
 
-Pi provider extension that discovers models from [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) and registers them for use in pi. It supports catalog-driven OpenAI Fast mode and also ships a small TUI helper that shows elapsed runtime and a TPS summary after each agent turn.
+Provider extension that discovers models from [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) and registers them for use in Pi Coding Agent or compatible hosts such as Oh My Pi (OMP). It supports catalog-driven OpenAI Fast mode and also ships a small TUI helper that shows elapsed runtime and a TPS summary after each agent turn.
 
 ## What it does
 
@@ -16,19 +16,25 @@ Pi provider extension that discovers models from [CLIProxyAPI](https://github.co
 ## Install
 
 ```bash
-# from npm
+# Pi Coding Agent
 pi install npm:@router-for-me/pi-cliproxyapi-provider
+
+# Oh My Pi
+omp plugin install @router-for-me/pi-cliproxyapi-provider
 
 # from a local checkout
 pi install /absolute/path/to/pi-cliproxyapi-provider
+omp plugin link /absolute/path/to/pi-cliproxyapi-provider
 
-# or temporarily for one run
+# or temporarily for one Pi run
 pi -e /absolute/path/to/pi-cliproxyapi-provider
 ```
 
+Below, `<agent-dir>` means `~/.pi/agent` for Pi or `~/.omp/agent` for OMP.
+
 ## Login-style setup (recommended)
 
-This plugin needs both **baseUrl** and **apiKey**. pi's built-in `/login` only supports multi-field prompts on the account/OAuth path, so CLIProxyAPI appears under **Sign in with an account** (not API key).
+This plugin needs both **baseUrl** and **apiKey**. The host's built-in `/login` uses the account/OAuth path for multi-field prompts, so CLIProxyAPI appears under **Sign in with an account** (not API key).
 
 ### Preferred: /login shortcuts
 
@@ -42,7 +48,7 @@ or:
 /login cliproxyapi
 ```
 
-These shortcuts jump straight into CLIProxyAPI's multi-field baseUrl + API key prompts. The provider is registered as OAuth-only, so pi does not ask you to choose between API key and account first.
+These shortcuts jump straight into CLIProxyAPI's multi-field baseUrl + API key prompts. The provider is registered as OAuth-only, so the host does not ask you to choose between API key and account first.
 
 ### Menu path
 
@@ -67,8 +73,8 @@ Final login validation calls `{root}/v1/models?client_version=pi` (this always b
 On success:
 
 - models are registered immediately in the current session (0 models is allowed)
-- `baseUrl` / `apiKey` are written to `~/.pi/agent/cliproxyapi.json`
-- pi also stores the returned credential in `~/.pi/agent/auth.json`
+- `baseUrl` / `apiKey` are written to `<agent-dir>/cliproxyapi.json`
+- the host also stores the returned credential in `<agent-dir>/auth.json`
 
 Re-run `/login CLIProxyAPI` or `/login cliproxyapi` anytime to reconfigure. The built-in `/logout` command only removes credentials saved in `auth.json`; it does not erase `cliproxyapi.json`. Remove or update that file if you also need to clear the provider configuration.
 
@@ -78,7 +84,7 @@ You can still configure without `/login`.
 
 ### Config file
 
-`~/.pi/agent/cliproxyapi.json`:
+`<agent-dir>/cliproxyapi.json`:
 
 ```json
 {
@@ -130,7 +136,7 @@ Preferred form is **host:port only**:
 | `http://127.0.0.1:8317/v1` | `http://127.0.0.1:8317/backend-api/` | same models URL |
 | `127.0.0.1:8317` | `http://127.0.0.1:8317/backend-api/` | same models URL |
 
-pi then sends inference traffic to `{inference}/codex/responses`.
+The host then sends inference traffic to `{inference}/codex/responses`.
 
 ## Fast mode
 
@@ -142,11 +148,11 @@ Fast is **off by default**. Toggle the global preference with:
 /fast
 ```
 
-Each invocation switches Fast between on and off and writes the result to `~/.pi/agent/cliproxyapi.json`. On the next startup, a persisted `true` value immediately enables Fast for catalog-supported models. Fast remains ineffective for unsupported models, so their requests are left unchanged. If `CLIPROXYAPI_FAST` is set, that environment variable still takes precedence on startup.
+Each invocation switches Fast between on and off and writes the result to `<agent-dir>/cliproxyapi.json`. On the next startup, a persisted `true` value immediately enables Fast for catalog-supported models. Fast remains ineffective for unsupported models, so their requests are left unchanged. If `CLIPROXYAPI_FAST` is set, that environment variable still takes precedence on startup.
 
-When Fast is effective, pi's model status appends a yellow lowercase `fast`, for example `gpt-5.6-sol • xhigh • fast`. When Fast is off or the selected model is unsupported, the original model status remains unchanged. Supported models do not produce a separate status notification. Running `/fast` with an unsupported model still updates the global preference; enabling it warns that the current model cannot use Fast.
+When Fast is effective, the host's model status appends a yellow lowercase `fast`, for example `gpt-5.6-sol • xhigh • fast`. When Fast is off or the selected model is unsupported, the original model status remains unchanged. Supported models do not produce a separate status notification. Running `/fast` with an unsupported model still updates the global preference; enabling it warns that the current model cannot use Fast.
 
-Fast capability is catalog-driven: the plugin considers a CLIProxyAPI model Fast-capable when its `service_tiers` field is a non-empty array. The `additional_speed_tiers` field is ignored. For supported models, Fast injects `service_tier: "priority"`; unsupported models are left unchanged. Fast is independent from pi's reasoning/thinking level. When `models.dev` provides `experimental.modes.fast.cost`, the registered model cost switches to those Fast rates as well; the provider is refreshed when `/fast` is toggled. If no Fast price is published, the standard price is retained. The plugin does not guess Fast prices from `-pro`/`-fast` model IDs.
+Fast capability is catalog-driven: the plugin considers a CLIProxyAPI model Fast-capable when its `service_tiers` field is a non-empty array. The `additional_speed_tiers` field is ignored. For supported models, Fast injects `service_tier: "priority"`; unsupported models are left unchanged. Fast is independent from the host's reasoning/thinking level. When `models.dev` provides `experimental.modes.fast.cost`, the registered model cost switches to those Fast rates as well; the provider is refreshed when `/fast` is toggled. If no Fast price is published, the standard price is retained. The plugin does not guess Fast prices from `-pro`/`-fast` model IDs.
 
 ## Pausing provider requests
 
@@ -213,7 +219,7 @@ The raw `models.dev` response is cached for 24 hours at `~/.pi/agent/tmp/models-
 
 ## Migration from static models.json
 
-If you previously maintained a static provider such as `cpa-responses` in `~/.pi/agent/models.json`:
+If you previously maintained a static provider such as `cpa-responses` in `<agent-dir>/models.json`:
 
 1. Install this package and run `/login CLIProxyAPI` or `/login cliproxyapi` (or set `cliproxyapi.json`).
 2. Point `defaultProvider` / `enabledModels` at `cliproxyapi/<model-id>` (or set `providerId` to `cpa-responses` for a drop-in id).
@@ -227,7 +233,7 @@ The package also registers `extensions/tps.ts`, which only activates for the pri
 - When the agent settles, the footer keeps the final elapsed time and a notification reports approximate TPS plus token usage (`out` / `in` / cache r/w / total).
 - Subagent and print-mode sessions do not own the timer, clear the parent footer, or emit TPS toasts.
 
-Disable just this helper via `pi config` if you only want the CLIProxyAPI provider.
+Disable just this helper via `pi config` or `omp config` if you only want the CLIProxyAPI provider.
 
 ## Failure behavior
 

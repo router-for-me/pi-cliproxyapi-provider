@@ -66,10 +66,15 @@ export function wrapStreamSimpleForFast(
 	shouldUseFast?: (model: Model<Api>) => boolean,
 ): CliproxyCodexStreamSimple {
 	return (model, context, streamOptions) => {
+		const hostSystemPrompt = (context as Context & { systemPrompt?: string | string[] }).systemPrompt;
+		const compatibleContext = Array.isArray(hostSystemPrompt)
+			? { ...context, systemPrompt: hostSystemPrompt.join("\n\n") }
+			: context;
+
 		if (!shouldUseFast?.(model)) {
-			return streamSimple(model, context, streamOptions);
+			return streamSimple(model, compatibleContext, streamOptions);
 		}
-		return streamSimple(model, context, {
+		return streamSimple(model, compatibleContext, {
 			...streamOptions,
 			onPayload: (payload, payloadModel) => applyFastPayloadHook(payload, payloadModel, streamOptions?.onPayload),
 		});

@@ -364,7 +364,11 @@ function registerProvider(
 
 	// Replace any previous registration so an earlier ambient apiKey does not linger
 	// via registerProvider merge semantics and reintroduce the auth-type selector.
-	pi.unregisterProvider(providerId);
+	// Compatible hosts such as Oh My Pi may not expose unregisterProvider yet;
+	// their startup registration is still safe because no previous provider exists.
+	if (typeof pi.unregisterProvider === "function") {
+		pi.unregisterProvider(providerId);
+	}
 
 	pi.registerProvider(providerId, {
 		name: providerName,
