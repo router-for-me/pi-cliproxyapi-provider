@@ -29,6 +29,72 @@ export const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as
 export const DEFAULT_MAX_TOKENS = 16384;
 export const DEFAULT_CONTEXT_WINDOW = 128000;
 
+// --- Context-cap support ---
+// Reads from ~/.pi/agent/extensions/context-cap.json (shared with pi-context-cap extension).
+
+interface ContextCapConfig {
+	cap?: number;
+	maxTokens?: number;
+	appliesOver?: number;
+	matchPatterns?: string[];
+	models?: Record<string, number | { contextWindow?: number; maxTokens?: number }>;
+}
+
+let _capConfig: ContextCapConfig | null = null;
+let _capConfigLoaded = false;
+
+function loadCapConfig(): ContextCapConfig {
+	if (_capConfigLoaded) return _capConfig ?? {};
+	_capConfigLoaded = true;
+	try {
+		const agentDir = process.env.PI_AGENT_DIR || join(process.env.HOME || "", ".pi", "agent");
+		const capPath = join(agentDir, "extensions", "context-cap.json");
+		const raw = readFileSync(capPath, "utf-8");
+		_capConfig = JSON.parse(raw) as ContextCapConfig;
+	} catch {
+		_capConfig = {};
+	}
+	return _capConfig ?? {};
+}
+
+function matchesPatterns(modelId: string, patterns: string[]): boolean {
+	if (patterns.length === 0) return false;
+	const id = modelId.toLowerCase();
+	return patterns.some((p) => p === "*" || id.includes(p.toLowerCase()));
+}
+
+/** Apply context-cap config to a model's contextWindow and maxTokens. */
+function applyCap(id: string, contextWindow: number, maxTokens: number): { contextWindow: number; maxTokens: number } {
+	const cfg = loadCapConfig();
+	let cw = contextWindow;
+	let mt = maxTokens;
+
+	// Per-model override wins
+	const perModel = cfg.models?.[id];
+	if (perModel != null) {
+		if (typeof perModel === "number") {
+			if (cw > perModel) cw = perModel;
+		} else {
+			if (perModel.contextWindow != null && cw > perModel.contextWindow) cw = perModel.contextWindow;
+			if (perModel.maxTokens != null && mt > perModel.maxTokens) mt = perModel.maxTokens;
+		}
+		return { contextWindow: cw, maxTokens: mt };
+	}
+
+	// Global cap
+	const patterns = cfg.matchPatterns ?? [];
+	if (!matchesPatterns(id, patterns)) return { contextWindow: cw, maxTokens: mt };
+
+	const appliesOver = cfg.appliesOver ?? 200_000;
+	const cap = cfg.cap ?? 200_000;
+	if (cw > appliesOver && cw > cap) cw = cap;
+
+	const capMaxTokens = cfg.maxTokens ?? 0;
+	if (capMaxTokens > 0 && mt > capMaxTokens) mt = capMaxTokens;
+
+	return { contextWindow: cw, maxTokens: mt };
+}
+
 const PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 
 export interface CliproxyConfigFile {
@@ -487,14 +553,17 @@ export function toPiModel(
 		? matchModelCost(id, costCatalog, fastMode && supportsFastServiceTier(model))
 		: { ...ZERO_COST };
 
+	// Apply context-cap config
+	const capped = applyCap(id, contextWindow, DEFAULT_MAX_TOKENS);
+
 	return {
 		id,
 		name: (model.display_name ?? model.name ?? id).trim() || id,
 		reasoning: hasReasoning,
 		input: buildInputModalities(model),
 		cost,
-		contextWindow,
-		maxTokens: DEFAULT_MAX_TOKENS,
+		contextWindow: capped.contextWindow,
+		maxTokens: capped.maxTokens,
 		thinkingLevelMap: buildThinkingLevelMap(efforts),
 	};
 }
