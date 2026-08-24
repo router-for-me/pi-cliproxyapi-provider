@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	applyFastPayloadHook,
 	type CliproxyCodexStreamSimple,
+	loadCliproxyCodexStreams,
 	patchCodexSource,
 	resolveCodexModuleFromNodeEntry,
 	withPriorityServiceTier,
@@ -72,6 +73,13 @@ describe("Codex WebSocket transport patch", () => {
 		expect(patched).not.toContain('fallbackTransport: websocketStarted ? undefined : "sse",');
 		expect(patched).not.toContain("websocketSseFallbackSessions.add(sessionId);");
 		expect(patched).not.toMatch(/recordWebSocketSseFallback\([^)]*\);\s*break;/);
+		expect(patched).toContain("export function closeOpenAICodexWebSocketSessions(sessionId)");
+	});
+
+	it("exports closeOpenAICodexWebSocketSessions from the patched module instance", async () => {
+		const streams = await loadCliproxyCodexStreams(["cliproxyapi"]);
+		expect(typeof streams.closeOpenAICodexWebSocketSessions).toBe("function");
+		expect(() => streams.closeOpenAICodexWebSocketSessions("missing-session")).not.toThrow();
 	});
 });
 

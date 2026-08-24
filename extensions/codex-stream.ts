@@ -28,10 +28,13 @@ export type CliproxyCodexStreamSimple = (
 	options?: SimpleStreamOptions,
 ) => AssistantMessageEventStream;
 
+export type CloseCodexWebSocketSessions = (sessionId?: string) => void;
+
 export type CliproxyCodexStreams = {
 	streamSimple: CliproxyCodexStreamSimple;
 	stream: CliproxyCodexStreamSimple;
 	api: typeof CLIPROXYAPI_CODEX_API;
+	closeOpenAICodexWebSocketSessions: CloseCodexWebSocketSessions;
 };
 
 export interface CliproxyCodexStreamOptions {
@@ -278,11 +281,17 @@ export async function loadCliproxyCodexStreams(
 	const mod = (await import(pathToFileURL(outPath).href)) as {
 		streamSimple: CliproxyCodexStreamSimple;
 		stream: CliproxyCodexStreamSimple;
+		closeOpenAICodexWebSocketSessions?: CloseCodexWebSocketSessions;
 	};
 
 	if (typeof mod.streamSimple !== "function" || typeof mod.stream !== "function") {
 		throw new Error("patched openai-codex-responses module missing streamSimple/stream exports");
 	}
+
+	// Must come from the patched module: its WebSocket cache is a separate Map
+	// from the stock @earendil-works/pi-ai openai-codex-responses instance.
+	const closeOpenAICodexWebSocketSessions =
+		typeof mod.closeOpenAICodexWebSocketSessions === "function" ? mod.closeOpenAICodexWebSocketSessions : () => {};
 
 	const streamSimple = wrapStreamSimpleForFast(mod.streamSimple, options.shouldUseFast);
 
@@ -290,5 +299,6 @@ export async function loadCliproxyCodexStreams(
 		api: CLIPROXYAPI_CODEX_API,
 		streamSimple,
 		stream: mod.stream,
+		closeOpenAICodexWebSocketSessions,
 	};
 }
