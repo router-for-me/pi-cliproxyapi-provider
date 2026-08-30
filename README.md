@@ -7,7 +7,7 @@ Pi provider extension that discovers models from [CLIProxyAPI](https://github.co
 1. Registers a provider that always appears in `/login` (account sign-in path).
 2. Interactive setup collects `baseUrl` + `apiKey` via `/login CLIProxyAPI` or `/login cliproxyapi`.
 3. Fetches `{root}/v1/models?client_version=pi`.
-4. Maps the CLIProxyAPI catalog into pi models, including Fast service-tier capability.
+4. Maps the CLIProxyAPI catalog into pi models, including canonical context/output capabilities and Fast service-tier support.
 5. Registers inference against `{root}/backend-api/`.
 6. Provides `/fast` to toggle OpenAI priority processing for supported models.
 7. Caches the model catalog in `~/.pi/agent/cliproxyapi-models.json`, refreshes it in the background on startup, and provides `/cliproxyapi-refresh` to force a refresh.
@@ -170,7 +170,7 @@ The provider keeps a separate cache file so startup stays fast when CLIProxyAPI 
 
 `~/.pi/agent/cliproxyapi-models.json`
 
-The cache stores only model metadata and derived endpoint URLs — the model list, Fast-capable IDs, `inferenceBaseUrl`, `modelsUrl`, and a `fetchedAt` timestamp. It **never** stores your API key or other credentials.
+The cache stores only model metadata and derived endpoint URLs — including each model's resolved `contextWindow` / `maxTokens`, Fast-capable IDs, `inferenceBaseUrl`, `modelsUrl`, and a `fetchedAt` timestamp. It **never** stores your API key or other credentials.
 
 | Property | Value |
 |----------|-------|
@@ -202,14 +202,23 @@ From CPA catalog entry → pi model:
 | ----------- | ---------- |
 | `slug` | `id` |
 | `display_name` | `name` |
-| `context_window` | `contextWindow` |
+| `context_window` / `max_context_window` | `contextWindow` |
+| `max_completion_tokens` / `max_tokens` | `maxTokens` |
 | `input_modalities` | `input` (`text` / `image`) |
 | `supported_reasoning_levels[].effort` | `thinkingLevelMap` + `reasoning` |
 | `visibility: "hide"` | skipped |
 
-Unsupported pi thinking levels are set to `null` so they are hidden in the UI. When available, prices are matched against canonical model entries in `models.dev`; `cost.tiers[].tier.size` becomes pi's `inputTokensAbove`, including thresholds such as `272000`. The legacy `context_over_200k` field is used only when no explicit tiers are present. Ambiguous reseller prices are not selected arbitrarily and fall back to zero. These are catalog/list prices, not a guarantee of CPA's own markup or billing.
+Unsupported pi thinking levels are set to `null` so they are hidden in the UI. Model limits and prices are resolved against canonical model entries in `models.dev`; `limit.context` / `limit.output` supply missing capabilities, and `cost.tiers[].tier.size` becomes pi's `inputTokensAbove`, including thresholds such as `272000`. The legacy `context_over_200k` field is used only when no explicit tiers are present. Ambiguous reseller prices are not selected arbitrarily and fall back to zero. These are catalog/list prices, not a guarantee of CPA's own markup or billing.
 
-The raw `models.dev` response is cached for 24 hours at `~/.pi/agent/tmp/models-dev-cache.json`. A fresh cache avoids the network request; an expired cache is refreshed with a three-second timeout, and stale data is retained if refresh fails. If neither the network nor a previous cache is available, pricing safely falls back to zero. A small explicit alias table covers known CLIProxyAPI variants such as `gemini-pro-agent` → `gemini-3.1-pro-preview`; unknown variants are not guessed.
+Capability resolution uses one fail-closed priority order:
+
+1. Positive `context_window` / `max_context_window` and `max_completion_tokens` / `max_tokens` explicitly returned by CLIProxyAPI.
+2. Exact canonical model metadata from `models.dev`, including the small explicit alias layer used for known proxy IDs such as `gemini-pro-agent` → `gemini-3.1-pro-preview`.
+3. Conservative defaults: 128,000 context and 16,384 max output.
+
+CLIProxyAPI's generated Pi catalog can assign both context fields the same generic 272,000-token template. That pair is not treated as an explicit model limit: an exact canonical match replaces it, while an unknown model falls back conservatively. The 272,000 value is retained when the same canonical entry publishes a 272,000 context price tier, preserving intentionally constrained models such as the GPT-5.6 short-context tier. Capability matching never uses normalized or fuzzy lookalikes; only exact IDs, namespace-stripped exact IDs, and documented aliases are eligible.
+
+The raw `models.dev` response is shared by capability and pricing resolution and cached for 24 hours at `~/.pi/agent/tmp/models-dev-cache.json`. A fresh cache avoids the network request; an expired cache is refreshed with a three-second timeout, and stale data is retained if refresh fails. If neither the network nor a previous cache is available, capabilities use the server's trusted explicit values or conservative defaults, while pricing falls back to zero.
 
 ## Migration from static models.json
 
@@ -240,4 +249,6 @@ Disable just this helper via `pi config` if you only want the CLIProxyAPI provid
   - HTTP 200 (including empty catalog) → credentials are persisted
   - non-200 / network / invalid baseUrl → nothing is persisted; re-enter baseUrl + API key
 - If CPA returns HTTP 200 with zero usable models: login still succeeds; re-run `/login CLIProxyAPI` later after models become available.
+- If the canonical catalog is unavailable, its stale disk cache is reused. With no catalog cache, startup still succeeds and existing models remain available using trusted server capabilities or the conservative 128,000 / 16,384 defaults.
+- Unknown or lookalike model IDs never borrow another model's capabilities.
 - If the selected model does not provide a non-empty `service_tiers` array: the request is left unchanged; `/fast` still updates the global preference and warns when enabling it.
