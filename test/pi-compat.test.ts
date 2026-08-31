@@ -104,6 +104,9 @@ describe("pi 0.82.0 compatibility", () => {
 					expect.objectContaining({
 						name: "CLIProxyAPI",
 						oauth: expect.any(Object),
+						headers: {
+							"X-Codex-Beta-Features": "remote_compaction_v2",
+						},
 					}),
 				);
 				// OAuth-only registration keeps `/login cliproxyapi` off the API-key selector.

@@ -119,6 +119,19 @@ Resolution order for connection settings:
 
 The Fast preference resolves separately as `CLIPROXYAPI_FAST` → `cliproxyapi.json` → `false`.
 
+### Pi transport preference
+
+The plugin does not define or override a separate transport setting. Pi's global `transport` preference is forwarded unchanged to the Codex stream implementation.
+
+| Pi setting | Pi-to-CLIProxyAPI behavior |
+| ------- | --------- |
+| `sse` | Uses the Codex SSE transport. |
+| `websocket` | Prefers WebSocket without cached-context deltas. Pi may fall back to Codex SSE if setup fails before response events begin. |
+| `websocket-cached` | Prefers WebSocket with session continuation and cached-context deltas, with the same pre-stream SSE fallback. |
+| `auto` | Defers selection and fallback behavior to Pi. |
+
+Pi's transport setting controls only the downstream Pi-to-CLIProxyAPI connection. CLIProxyAPI independently selects a credential and chooses that credential's upstream WebSocket or HTTP executor, so a mixed credential pool does not require a model-wide transport downgrade.
+
 ### baseUrl normalization
 
 Preferred form is **host:port only**:

@@ -371,6 +371,7 @@ function registerProvider(
 		baseUrl: endpoints.inferenceBaseUrl,
 		api: CLIPROXYAPI_CODEX_API,
 		streamSimple,
+		headers: { "X-Codex-Beta-Features": "remote_compaction_v2" },
 		// OAuth-only keeps `/login <provider>` on the multi-field account path.
 		// Pass apiKey only for ambient request auth when no /login credential exists
 		// (config file / env). Never pass both for /login flows.
