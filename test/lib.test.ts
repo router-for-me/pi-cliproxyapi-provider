@@ -173,6 +173,39 @@ describe("model mapping helpers", () => {
 		});
 	});
 
+	it("maps max_tokens from codex catalog entries", () => {
+		const model = toPiModel({ id: "gpt-5.6-sol", max_tokens: 128000 });
+
+		expect(model?.maxTokens).toBe(128000);
+	});
+
+	it("maps alternative output-token fields in priority order", () => {
+		const fromOutputTokens = toPiModel({
+			id: "claude-sonnet-5",
+			max_output_tokens: 128000,
+		});
+		const fromCompletionTokens = toPiModel({
+			id: "gpt-5-mini",
+			max_completion_tokens: 32768,
+		});
+		const preferred = toPiModel({
+			id: "custom-model",
+			max_tokens: 128000,
+			max_output_tokens: 64000,
+			max_completion_tokens: 32000,
+		});
+
+		expect(fromOutputTokens?.maxTokens).toBe(128000);
+		expect(fromCompletionTokens?.maxTokens).toBe(32768);
+		expect(preferred?.maxTokens).toBe(128000);
+	});
+
+	it("falls back when output-token metadata is not positive and finite", () => {
+		for (const value of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+			expect(toPiModel({ id: "invalid-limit", max_tokens: value })?.maxTokens).toBe(DEFAULT_MAX_TOKENS);
+		}
+	});
+
 	it("skips hide visibility and missing ids", () => {
 		expect(toPiModel({ slug: "x", visibility: "hide" })).toBeNull();
 		expect(toPiModel({ display_name: "no-id" })).toBeNull();
