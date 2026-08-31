@@ -10,7 +10,7 @@ import {
 	patchCodexSource,
 	resolveCodexModuleFromNodeEntry,
 	withPriorityServiceTier,
-	wrapStreamSimpleForFast,
+	wrapCliproxyCodexStream,
 } from "../extensions/codex-stream.ts";
 import { FastModeController } from "../extensions/fast.ts";
 import { FastFooterController, formatFastModelStatus } from "../extensions/fast-footer.ts";
@@ -350,18 +350,20 @@ describe("Fast pricing mapping", () => {
 });
 
 describe("Fast stream wrapper", () => {
-	it("passes options through unchanged when Fast is not effective", () => {
+	it("preserves options and payloads when Fast is not effective", async () => {
 		let captured: SimpleStreamOptions | undefined;
 		const streamResult = {} as ReturnType<CliproxyCodexStreamSimple>;
 		const baseStream: CliproxyCodexStreamSimple = (_model, _context, options) => {
 			captured = options;
 			return streamResult;
 		};
-		const wrapped = wrapStreamSimpleForFast(baseStream, () => false);
+		const wrapped = wrapCliproxyCodexStream(baseStream, () => false);
 		const options: SimpleStreamOptions = { timeoutMs: 1234 };
 
 		expect(wrapped(model, { messages: [] }, options)).toBe(streamResult);
-		expect(captured).toBe(options);
+		expect(captured?.timeoutMs).toBe(1234);
+		const payload = { model: "gpt-5.4", input: [] };
+		expect(await captured?.onPayload?.(payload, model)).toBe(payload);
 	});
 
 	it("preserves stream options and composes the Fast payload hook when enabled", async () => {
@@ -372,7 +374,7 @@ describe("Fast stream wrapper", () => {
 			captured = options;
 			return streamResult;
 		};
-		const wrapped = wrapStreamSimpleForFast(baseStream, () => true);
+		const wrapped = wrapCliproxyCodexStream(baseStream, () => true);
 		const options: SimpleStreamOptions = {
 			timeoutMs: 1234,
 			onPayload: (payload) => {
