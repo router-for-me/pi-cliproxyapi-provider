@@ -31,6 +31,8 @@ export const DEFAULT_CONTEXT_WINDOW = 128000;
 
 const PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 
+export type ProtocolMode = "openai-codex" | "openai-responses";
+
 export interface CliproxyConfigFile {
 	baseUrl?: string;
 	apiKey?: string;
@@ -38,6 +40,7 @@ export interface CliproxyConfigFile {
 	providerName?: string;
 	fast?: boolean;
 	pause?: boolean;
+	protocol?: ProtocolMode;
 }
 
 export interface ResolvedIdentity {
@@ -50,6 +53,7 @@ export interface ResolvedConnection {
 	apiKey: string;
 	inferenceBaseUrl: string;
 	modelsUrl: string;
+	protocol: ProtocolMode;
 }
 
 export interface CodexReasoningLevel {
@@ -169,6 +173,38 @@ export function firstNonEmpty(...values: Array<string | undefined | null>): stri
 	return undefined;
 }
 
+/** Auto-detect relay Responses URLs while preserving Codex as the default. */
+export function autoDetectProtocol(baseUrlInput: string): ProtocolMode {
+	try {
+		let raw = baseUrlInput.trim();
+		if (!raw) return "openai-codex";
+		if (!/^https?:\/\//i.test(raw)) raw = `http://${raw}`;
+		const url = new URL(raw);
+		const path = url.pathname.replace(/\/+$/, "");
+		if (path === "/v1" || path.endsWith("/v1")) {
+			return "openai-responses";
+		}
+	} catch {
+		// Malformed URLs retain the existing Codex default.
+	}
+	return "openai-codex";
+}
+
+/** Resolve protocol from env, config, then the URL shape. */
+export function resolveProtocol(agentDir: string, baseUrlInput: string): ProtocolMode {
+	const envProtocol = process.env.CLIPROXYAPI_PROTOCOL?.trim().toLowerCase();
+	if (envProtocol === "openai-responses") return "openai-responses";
+	if (envProtocol === "openai-codex") return "openai-codex";
+	try {
+		const config = loadConfigFile(agentDir);
+		if (config.protocol === "openai-responses") return "openai-responses";
+		if (config.protocol === "openai-codex") return "openai-codex";
+	} catch {
+		// Invalid or missing config falls through to URL detection.
+	}
+	return autoDetectProtocol(baseUrlInput);
+}
+
 /**
  * Normalize user-provided base URL into inference + models endpoints.
  *
@@ -177,7 +213,10 @@ export function firstNonEmpty(...values: Array<string | undefined | null>): stri
  * - /v1 rewritten to /backend-api for inference
  * - models always at {root}/v1/models?client_version=pi
  */
-export function resolveEndpoints(baseUrlInput: string): {
+export function resolveEndpoints(
+	baseUrlInput: string,
+	protocol: ProtocolMode = "openai-codex",
+): {
 	inferenceBaseUrl: string;
 	modelsUrl: string;
 	rootOrigin: string;
@@ -192,6 +231,23 @@ export function resolveEndpoints(baseUrlInput: string): {
 
 	const url = new URL(raw);
 	let path = url.pathname.replace(/\/+$/, "");
+
+	if (protocol === "openai-responses") {
+		let v1path: string;
+		if (path === "/v1" || path.endsWith("/v1")) {
+			v1path = path;
+		} else if (path === "" || path === "/" || path === "/backend-api") {
+			v1path = "/v1";
+		} else if (path.endsWith("/backend-api")) {
+			v1path = `${path.slice(0, -"/backend-api".length)}/v1`;
+		} else {
+			v1path = `${path}/v1`;
+		}
+		const inferenceBaseUrl = `${url.origin}${v1path}/`;
+		const modelsPath = `${v1path}/models`.replace(/\/{2,}/g, "/");
+		const modelsUrl = `${url.origin}${modelsPath}?client_version=${encodeURIComponent(CLIENT_VERSION)}`;
+		return { inferenceBaseUrl, modelsUrl, rootOrigin: url.origin };
+	}
 
 	if (path === "/v1") {
 		path = "/backend-api";
@@ -269,7 +325,8 @@ export function loadModelsCache(agentDir: string, baseUrlInput: string): ModelsC
 	const cachePath = join(agentDir, MODELS_CACHE_FILE_NAME);
 	try {
 		const parsed = JSON.parse(readFileSync(cachePath, "utf8")) as Partial<ModelsCacheFile>;
-		const endpoints = resolveEndpoints(baseUrlInput);
+		const protocol = resolveProtocol(agentDir, baseUrlInput);
+		const endpoints = resolveEndpoints(baseUrlInput, protocol);
 		if (
 			typeof parsed.fetchedAt !== "number" ||
 			parsed.modelsUrl !== endpoints.modelsUrl ||
@@ -396,12 +453,14 @@ export function resolveConnection(agentDir: string, providerId: string): Resolve
 		return null;
 	}
 
-	const endpoints = resolveEndpoints(baseUrlInput);
+	const protocol = resolveProtocol(agentDir, baseUrlInput);
+	const endpoints = resolveEndpoints(baseUrlInput, protocol);
 	return {
 		baseUrlInput,
 		apiKey,
 		inferenceBaseUrl: endpoints.inferenceBaseUrl,
 		modelsUrl: endpoints.modelsUrl,
+		protocol,
 	};
 }
 
@@ -857,7 +916,8 @@ export async function loadMappedModels(
 	const pricingEnabled = typeof timeoutOrFastMode === "boolean";
 	const effectiveFastMode = typeof timeoutOrFastMode === "boolean" ? timeoutOrFastMode : false;
 	const timeoutMs = typeof timeoutOrFastMode === "number" ? timeoutOrFastMode : MODELS_REQUEST_TIMEOUT_MS;
-	const endpoints = resolveEndpoints(baseUrlInput);
+	const protocol = agentDir ? resolveProtocol(agentDir, baseUrlInput) : autoDetectProtocol(baseUrlInput);
+	const endpoints = resolveEndpoints(baseUrlInput, protocol);
 	const [remoteModels, costCatalog] = await Promise.all([
 		fetchCodexModels(endpoints.modelsUrl, apiKey, timeoutMs, signal),
 		pricingEnabled ? fetchModelsDevCostMap(agentDir, false, signal) : Promise.resolve(undefined),
