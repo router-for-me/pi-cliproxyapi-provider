@@ -34,15 +34,14 @@ import {
 	isUnauthorizedModelsError,
 	loadAuthConnection,
 	loadConfigFile,
-	type PiProviderModel,
 	resolveConnection,
 	resolveEndpoints,
 	resolveFastDefault,
 	resolveIdentity,
-	resolveMappedModels,
 	resolvePauseDefault,
 	saveConfigFile,
 } from "./lib.ts";
+import { ModelCatalogController } from "./model-refresh.ts";
 import type { PauseController } from "./pause.ts";
 import { pauseController, waitForPauseToEnd } from "./pause.ts";
 import { registerTransientNetworkErrorRetry } from "./retry.ts";
@@ -58,23 +57,6 @@ class ConfigPersistenceError extends Error {
 interface RefreshResult {
 	modelCount: number;
 	modelsUrl: string;
-}
-
-class ModelRefreshCoordinator {
-	private generation = 0;
-	private activeController: AbortController | undefined;
-
-	begin(): { generation: number; signal: AbortSignal } {
-		this.activeController?.abort();
-		const controller = new AbortController();
-		this.activeController = controller;
-		this.generation += 1;
-		return { generation: this.generation, signal: controller.signal };
-	}
-
-	isCurrent(generation: number): boolean {
-		return this.generation === generation;
-	}
 }
 
 function logWarn(message: string): void {
@@ -154,43 +136,22 @@ async function promptConnection(
 	return { baseUrlInput, apiKey };
 }
 
-async function configureAndRegister(options: {
-	pi: ExtensionAPI;
+async function configureConnection(options: {
 	agentDir: string;
 	providerId: string;
 	providerName: string;
 	baseUrlInput: string;
 	apiKey: string;
-	defaultBaseUrl: string;
-	streamSimple: CliproxyCodexStreamSimple;
-	fastMode: FastModeController;
-	refreshCoordinator: ModelRefreshCoordinator;
-	onFastModeChange?: (enabled: boolean, ctx: ExtensionContext) => Promise<void>;
+	catalog: ModelCatalogController;
+	signal?: AbortSignal;
 }): Promise<RefreshResult> {
-	const {
-		pi,
-		agentDir,
-		providerId,
-		providerName,
+	const { agentDir, providerId, providerName, baseUrlInput, apiKey, catalog, signal } = options;
+	const connection = {
 		baseUrlInput,
 		apiKey,
-		defaultBaseUrl,
-		streamSimple,
-		fastMode,
-		refreshCoordinator,
-		onFastModeChange,
-	} = options;
-
-	const refresh = refreshCoordinator.begin();
-	const { loaded } = await resolveMappedModels(agentDir, baseUrlInput, apiKey, {
-		forceRefresh: true,
-		fastMode: fastMode.isEnabled(),
-		signal: refresh.signal,
-		shouldCommit: () => refreshCoordinator.isCurrent(refresh.generation),
-	});
-	if (!refreshCoordinator.isCurrent(refresh.generation)) {
-		throw new Error("Model refresh was superseded by a newer request.");
-	}
+		...resolveEndpoints(baseUrlInput),
+	};
+	await catalog.refreshConnection(connection, signal);
 
 	try {
 		saveConfigFile(agentDir, {
@@ -203,47 +164,17 @@ async function configureAndRegister(options: {
 		throw new ConfigPersistenceError(error);
 	}
 
-	// /login stores oauth credentials itself; keep the provider OAuth-only so
-	// `/login <provider>` skips the API-key vs account selector.
-	registerProvider(pi, {
-		providerId,
-		providerName,
-		baseUrlInput,
-		models: loaded.models,
-		defaultBaseUrl: baseUrlInput || defaultBaseUrl,
-		agentDir,
-		streamSimple,
-		fastMode,
-		refreshCoordinator,
-		onFastModeChange,
-	});
-	fastMode.setSupportedModelIds(loaded.fastModelIds);
-
-	return { modelCount: loaded.models.length, modelsUrl: loaded.modelsUrl };
+	return { modelCount: catalog.getModels().length, modelsUrl: connection.modelsUrl };
 }
 
 function createOAuthHandlers(options: {
-	pi: ExtensionAPI;
 	agentDir: string;
 	providerId: string;
 	providerName: string;
 	defaultBaseUrl: string;
-	streamSimple: CliproxyCodexStreamSimple;
-	fastMode: FastModeController;
-	refreshCoordinator: ModelRefreshCoordinator;
-	onFastModeChange?: (enabled: boolean, ctx: ExtensionContext) => Promise<void>;
+	catalog: ModelCatalogController;
 }) {
-	const {
-		pi,
-		agentDir,
-		providerId,
-		providerName,
-		defaultBaseUrl,
-		streamSimple,
-		fastMode,
-		refreshCoordinator,
-		onFastModeChange,
-	} = options;
+	const { agentDir, providerId, providerName, defaultBaseUrl, catalog } = options;
 
 	return {
 		name: providerName,
@@ -260,18 +191,14 @@ function createOAuthHandlers(options: {
 
 				callbacks.onProgress?.("Validating credentials via models endpoint...");
 				try {
-					const result = await configureAndRegister({
-						pi,
+					const result = await configureConnection({
 						agentDir,
 						providerId,
 						providerName,
 						baseUrlInput,
 						apiKey,
-						defaultBaseUrl,
-						streamSimple,
-						fastMode,
-						refreshCoordinator,
-						onFastModeChange,
+						catalog,
+						signal: callbacks.signal,
 					});
 
 					logInfo(`login ok: registered ${result.modelCount} models from ${result.modelsUrl}`);
@@ -326,57 +253,27 @@ function registerProvider(
 		providerName: string;
 		baseUrlInput: string;
 		apiKey?: string;
-		models?: PiProviderModel[];
 		defaultBaseUrl: string;
 		agentDir: string;
 		streamSimple: CliproxyCodexStreamSimple;
-		fastMode: FastModeController;
-		refreshCoordinator?: ModelRefreshCoordinator;
-		onFastModeChange?: (enabled: boolean, ctx: ExtensionContext) => Promise<void>;
+		catalog: ModelCatalogController;
 	},
 ): void {
-	const {
-		providerId,
-		providerName,
-		baseUrlInput,
-		apiKey,
-		models,
-		defaultBaseUrl,
-		agentDir,
-		streamSimple,
-		fastMode,
-		onFastModeChange,
-	} = options;
-	const refreshCoordinator = options.refreshCoordinator ?? new ModelRefreshCoordinator();
-
+	const { providerId, providerName, baseUrlInput, apiKey, defaultBaseUrl, agentDir, streamSimple, catalog } = options;
 	const endpoints = resolveEndpoints(baseUrlInput);
-	const oauth = createOAuthHandlers({
-		pi,
-		agentDir,
-		providerId,
-		providerName,
-		defaultBaseUrl,
-		streamSimple,
-		fastMode,
-		refreshCoordinator,
-		onFastModeChange,
-	});
-
-	// Replace any previous registration so an earlier ambient apiKey does not linger
-	// via registerProvider merge semantics and reintroduce the auth-type selector.
-	pi.unregisterProvider(providerId);
+	const oauth = createOAuthHandlers({ agentDir, providerId, providerName, defaultBaseUrl, catalog });
 
 	pi.registerProvider(providerId, {
 		name: providerName,
 		baseUrl: endpoints.inferenceBaseUrl,
 		api: CLIPROXYAPI_CODEX_API,
 		streamSimple,
-		// OAuth-only keeps `/login <provider>` on the multi-field account path.
-		// Pass apiKey only for ambient request auth when no /login credential exists
-		// (config file / env). Never pass both for /login flows.
+		// Keep stored /login credentials OAuth-only; ambient config/env setups
+		// retain their request apiKey fallback without changing refresh identity.
 		oauth,
 		...(apiKey ? { apiKey } : {}),
-		...(models && models.length > 0 ? { models } : {}),
+		models: catalog.getModels(),
+		refreshModels: catalog.refreshModels,
 	});
 }
 
@@ -507,28 +404,29 @@ export function registerFastCommand(options: {
 	});
 }
 
+async function activateRefreshedCurrentModel(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	providerId: string,
+): Promise<void> {
+	const currentModel = ctx.model;
+	if (!currentModel || currentModel.provider !== providerId) return;
+	const refreshedModel = ctx.modelRegistry.find(providerId, currentModel.id);
+	if (!refreshedModel) {
+		throw new Error(`Refreshed model ${providerId}/${currentModel.id} is unavailable`);
+	}
+	if (!(await pi.setModel(refreshedModel))) {
+		throw new Error(`Unable to activate refreshed model ${providerId}/${currentModel.id}`);
+	}
+}
+
 export function registerRefreshCommand(options: {
 	pi: ExtensionAPI;
 	agentDir: string;
 	providerId: string;
 	providerName: string;
-	defaultBaseUrl: string;
-	streamSimple: CliproxyCodexStreamSimple;
-	fastMode: FastModeController;
-	refreshCoordinator?: ModelRefreshCoordinator;
-	onRefresh?: (connection: NonNullable<ReturnType<typeof resolveConnection>>) => Promise<RefreshResult | undefined>;
 }): void {
-	const {
-		pi,
-		agentDir,
-		providerId,
-		providerName,
-		defaultBaseUrl,
-		streamSimple,
-		fastMode,
-		refreshCoordinator,
-		onRefresh,
-	} = options;
+	const { pi, agentDir, providerId, providerName } = options;
 
 	pi.registerCommand("cliproxyapi-refresh", {
 		description: "Force refresh CLIProxyAPI models from the remote catalog.",
@@ -548,39 +446,13 @@ export function registerRefreshCommand(options: {
 			}
 
 			try {
-				let result: RefreshResult | undefined;
-				if (onRefresh) {
-					result = await onRefresh(connection);
-					if (!result) return;
-				} else {
-					const refresh = refreshCoordinator?.begin();
-					const { loaded } = await resolveMappedModels(agentDir, connection.baseUrlInput, connection.apiKey, {
-						forceRefresh: true,
-						fastMode: fastMode.isEnabled(),
-						signal: refresh?.signal,
-						shouldCommit: refresh ? () => refreshCoordinator?.isCurrent(refresh.generation) ?? true : undefined,
-					});
-					if (refresh && !refreshCoordinator?.isCurrent(refresh.generation)) return;
-					fastMode.setSupportedModelIds(loaded.fastModelIds);
-
-					const hasStoredLogin = hasLoginCredential(agentDir, providerId);
-					registerProvider(pi, {
-						providerId,
-						providerName,
-						baseUrlInput: connection.baseUrlInput,
-						apiKey: hasStoredLogin ? undefined : connection.apiKey,
-						models: loaded.models,
-						defaultBaseUrl,
-						agentDir,
-						streamSimple,
-						fastMode,
-						refreshCoordinator,
-					});
-
-					result = { modelCount: loaded.models.length, modelsUrl: loaded.modelsUrl };
-				}
-
-				ctx.ui.notify(`Refreshed ${result.modelCount} CLIProxyAPI models from ${result.modelsUrl}.`, "info");
+				const refresh = await ctx.modelRegistry.refresh({ providers: [providerId], force: true });
+				const error = refresh.errors.get(providerId);
+				if (error) throw error;
+				if (refresh.aborted) return;
+				await activateRefreshedCurrentModel(pi, ctx, providerId);
+				const modelCount = ctx.modelRegistry.getProvider(providerId)?.getModels().length ?? 0;
+				ctx.ui.notify(`Refreshed ${modelCount} CLIProxyAPI models from ${connection.modelsUrl}.`, "info");
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				ctx.ui.notify(`Failed to refresh CLIProxyAPI models: ${message}`, "error");
@@ -619,7 +491,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		logWarn(`invalid Fast configuration (${message}); using fast=false`);
 	}
 	const fastMode = new FastModeController(fastEnabled);
-	const modelRefreshCoordinator = new ModelRefreshCoordinator();
 
 	let streamSimple: CliproxyCodexStreamSimple;
 	try {
@@ -633,12 +504,35 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		return;
 	}
 
+	const catalog = new ModelCatalogController(agentDir, fastMode, () =>
+		resolveConnection(agentDir, identity.providerId),
+	);
+	const connection = resolveConnection(agentDir, identity.providerId);
+	let startupFromCache = false;
+	if (connection) {
+		try {
+			startupFromCache = await catalog.initialize(connection);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (isUnauthorizedModelsError(error)) {
+				logWarn(`models request unauthorized (${message}). Use /login ${identity.providerName} to reconfigure.`);
+			} else {
+				logWarn(
+					`failed to load models (${message}). Use /login ${identity.providerName} or check ${CONFIG_FILE_NAME} / CLIPROXYAPI_* env vars.`,
+				);
+			}
+		}
+	}
+
 	const fastFooter = new FastFooterController(identity.providerId, fastMode, () =>
 		proactiveCompaction.getCompactionSettings(),
 	);
-	let refreshModelsForFast: ((ctx: ExtensionContext) => Promise<void>) | undefined;
-	const onFastModeChange = async (_enabled: boolean, ctx: ExtensionContext): Promise<void> => {
-		await refreshModelsForFast?.(ctx);
+	const refreshNativeModels = async (ctx: ExtensionContext): Promise<void> => {
+		const refresh = await ctx.modelRegistry.refresh({ providers: [identity.providerId], force: true });
+		const error = refresh.errors.get(identity.providerId);
+		if (error) throw error;
+		if (refresh.aborted) return;
+		await activateRefreshedCurrentModel(pi, ctx, identity.providerId);
 	};
 	registerFastCommand({
 		pi,
@@ -646,106 +540,45 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		providerId: identity.providerId,
 		fastMode,
 		onStatusChange: (ctx) => fastFooter.refresh(ctx),
-		onModeChange: onFastModeChange,
+		onModeChange: async (_enabled, ctx) => refreshNativeModels(ctx),
 	});
 	fastFooter.register(pi);
 
-	// Always register oauth so the provider is visible in /login immediately after install.
+	const hasStoredLogin = hasLoginCredential(agentDir, identity.providerId);
 	registerProvider(pi, {
 		providerId: identity.providerId,
 		providerName: identity.providerName,
-		baseUrlInput: defaultBaseUrl,
+		baseUrlInput: connection?.baseUrlInput ?? defaultBaseUrl,
+		apiKey: connection && !hasStoredLogin ? connection.apiKey : undefined,
 		defaultBaseUrl,
 		agentDir,
 		streamSimple,
-		fastMode,
-		refreshCoordinator: modelRefreshCoordinator,
-		onFastModeChange: onFastModeChange,
+		catalog,
 	});
 	registerTransientNetworkErrorRetry(pi, identity.providerId);
-
-	const connection = resolveConnection(agentDir, identity.providerId);
-	const registerConfiguredProvider = async (
-		currentConnection: NonNullable<ReturnType<typeof resolveConnection>>,
-		options: { forceRefresh?: boolean } = {},
-	): Promise<RefreshResult | undefined> => {
-		const refresh = modelRefreshCoordinator.begin();
-		try {
-			const { loaded, fromCache } = await resolveMappedModels(
-				agentDir,
-				currentConnection.baseUrlInput,
-				currentConnection.apiKey,
-				{
-					forceRefresh: options.forceRefresh,
-					fastMode: fastMode.isEnabled(),
-					signal: refresh.signal,
-					shouldCommit: () => modelRefreshCoordinator.isCurrent(refresh.generation),
-				},
-			);
-			if (!modelRefreshCoordinator.isCurrent(refresh.generation)) return undefined;
-
-			fastMode.setSupportedModelIds(loaded.fastModelIds);
-
-			// Prefer OAuth-only registration when /login already stored credentials so
-			// `/login <provider>` jumps straight into the multi-field flow. Fall back to
-			// ambient apiKey only for config-file / env setups without auth.json.
-			const hasStoredLogin = hasLoginCredential(agentDir, identity.providerId);
-			registerProvider(pi, {
-				providerId: identity.providerId,
-				providerName: identity.providerName,
-				baseUrlInput: currentConnection.baseUrlInput,
-				apiKey: hasStoredLogin ? undefined : currentConnection.apiKey,
-				models: loaded.models,
-				defaultBaseUrl,
-				agentDir,
-				streamSimple,
-				fastMode,
-				refreshCoordinator: modelRefreshCoordinator,
-				onFastModeChange,
-			});
-
-			if (fromCache && !options.forceRefresh) {
-				void registerConfiguredProvider(currentConnection, { forceRefresh: true }).catch((error) => {
-					const message = error instanceof Error ? error.message : String(error);
-					logWarn(`failed to refresh cached models (${message}); keeping the cached model list.`);
-				});
-			}
-
-			return { modelCount: loaded.models.length, modelsUrl: loaded.modelsUrl };
-		} catch (error) {
-			if (!modelRefreshCoordinator.isCurrent(refresh.generation)) return undefined;
-			throw error;
-		}
-	};
-	refreshModelsForFast = async (ctx: ExtensionContext): Promise<void> => {
-		const currentConnection = resolveConnection(agentDir, identity.providerId);
-		if (!currentConnection) return;
-
-		const refreshed = await registerConfiguredProvider(currentConnection, { forceRefresh: true });
-		if (!refreshed) return;
-		const currentModel = ctx.model;
-		if (!currentModel || currentModel.provider !== identity.providerId) return;
-
-		const refreshedModel = ctx.modelRegistry.find(identity.providerId, currentModel.id);
-		if (!refreshedModel) {
-			throw new Error(`Refreshed model ${identity.providerId}/${currentModel.id} is unavailable`);
-		}
-		if (JSON.stringify(refreshedModel.cost) === JSON.stringify(currentModel.cost)) return;
-		if (!(await pi.setModel(refreshedModel))) {
-			throw new Error(`Unable to activate refreshed model ${identity.providerId}/${currentModel.id}`);
-		}
-	};
 	registerRefreshCommand({
 		pi,
 		agentDir,
 		providerId: identity.providerId,
 		providerName: identity.providerName,
-		defaultBaseUrl,
-		streamSimple,
-		fastMode,
-		refreshCoordinator: modelRefreshCoordinator,
-		onRefresh: (currentConnection) => registerConfiguredProvider(currentConnection, { forceRefresh: true }),
 	});
+
+	if (startupFromCache) {
+		pi.on("session_start", (_event, ctx) => {
+			void ctx.modelRegistry
+				.refresh({ providers: [identity.providerId] })
+				.then((refresh) => {
+					const error = refresh.errors.get(identity.providerId);
+					if (error) {
+						logWarn(`failed to refresh cached models (${error.message}); keeping the cached model list.`);
+					}
+				})
+				.catch((error) => {
+					const message = error instanceof Error ? error.message : String(error);
+					logWarn(`failed to start cached model refresh (${message}); keeping the cached model list.`);
+				});
+		});
+	}
 
 	if (!connection) {
 		logInfo(
@@ -753,19 +586,5 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				`Menu path: /login → Sign in with an account → ${identity.providerName}. ` +
 				`Or set ${CONFIG_FILE_NAME} / CLIPROXYAPI_API_KEY.`,
 		);
-		return;
-	}
-
-	try {
-		await registerConfiguredProvider(connection);
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		if (isUnauthorizedModelsError(error)) {
-			logWarn(`models request unauthorized (${message}). Use /login ${identity.providerName} to reconfigure.`);
-		} else {
-			logWarn(
-				`failed to load models (${message}). Use /login ${identity.providerName} or check ${CONFIG_FILE_NAME} / CLIPROXYAPI_* env vars.`,
-			);
-		}
 	}
 }

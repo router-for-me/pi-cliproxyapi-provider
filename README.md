@@ -1,6 +1,6 @@
 # pi-cliproxyapi-provider
 
-Pi provider extension that discovers models from [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) and registers them for use in pi. It supports catalog-driven OpenAI Fast mode and also ships a small TUI helper that shows elapsed runtime and a TPS summary after each agent turn.
+Pi provider extension that discovers models from [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) and registers them for use in pi. It supports catalog-driven OpenAI Fast mode and also ships a small TUI helper that shows elapsed runtime and a TPS summary after each agent turn. This release requires pi `>=0.84.3` for the native provider model-refresh lifecycle.
 
 ## What it does
 
@@ -10,7 +10,7 @@ Pi provider extension that discovers models from [CLIProxyAPI](https://github.co
 4. Maps the CLIProxyAPI catalog into pi models, including canonical context/output capabilities and Fast service-tier support.
 5. Registers inference against `{root}/backend-api/`.
 6. Provides `/fast` to toggle OpenAI priority processing for supported models.
-7. Caches the model catalog in `~/.pi/agent/cliproxyapi-models.json`, refreshes it in the background on startup, and provides `/cliproxyapi-refresh` to force a refresh.
+7. Caches the model catalog in `~/.pi/agent/cliproxyapi-models.json` and exposes one native pi `refreshModels` lifecycle for startup, background, `/fast`, and `/cliproxyapi-refresh` updates.
 8. In interactive TUI sessions, shows footer elapsed time during runs and a TPS / token usage toast when the agent settles.
 
 ## Install
@@ -146,7 +146,7 @@ Each invocation switches Fast between on and off and writes the result to `~/.pi
 
 When Fast is effective, pi's model status appends a yellow lowercase `fast`, for example `gpt-5.6-sol • xhigh • fast`. When Fast is off or the selected model is unsupported, the original model status remains unchanged. Supported models do not produce a separate status notification. Running `/fast` with an unsupported model still updates the global preference; enabling it warns that the current model cannot use Fast.
 
-Fast capability is catalog-driven: the plugin considers a CLIProxyAPI model Fast-capable when its `service_tiers` field is a non-empty array. The `additional_speed_tiers` field is ignored. For supported models, Fast injects `service_tier: "priority"`; unsupported models are left unchanged. Fast is independent from pi's reasoning/thinking level. When `models.dev` provides `experimental.modes.fast.cost`, the registered model cost switches to those Fast rates as well; the provider is refreshed when `/fast` is toggled. If no Fast price is published, the standard price is retained. The plugin does not guess Fast prices from `-pro`/`-fast` model IDs.
+Fast capability is catalog-driven: the plugin considers a CLIProxyAPI model Fast-capable when its `service_tiers` field is a non-empty array. The `additional_speed_tiers` field is ignored. For supported models, Fast injects `service_tier: "priority"`; unsupported models are left unchanged. Fast is independent from pi's reasoning/thinking level. When `models.dev` provides `experimental.modes.fast.cost`, the registered model cost switches to those Fast rates as well; `/fast` asks pi to run the provider's native model refresh and reactivates the current model with the refreshed metadata. If no Fast price is published, the standard price is retained. The plugin does not guess Fast prices from `-pro`/`-fast` model IDs.
 
 ## Pausing provider requests
 
@@ -182,14 +182,16 @@ The cache stores only model metadata and derived endpoint URLs — including eac
 
 When the provider loads (including session resume):
 
-1. If a cache exists for the configured `baseUrl`, its models are registered immediately. A remote query to `{root}/v1/models?client_version=pi` then runs in the background; on success, the cache is rewritten and the registered model list is refreshed. If the query fails, the existing cache remains active.
-2. If no matching cache exists, the remote query runs synchronously. On success, the cache is written and the fetched models are registered. If it fails, startup logs a warning and no models are registered until the proxy responds.
+1. If a cache exists for the configured `baseUrl`, the native provider callback restores it immediately. Once the session starts, pi runs the same callback with network access in the background; success atomically replaces the catalog and rewrites the cache, while failure leaves the stale cache active.
+2. If no matching cache exists, startup invokes the same callback synchronously with network access so normal startup and `pi --list-models` can see the CLIProxyAPI catalog. On failure, startup logs a warning and keeps the last in-memory list unchanged.
+
+Pi owns refresh cancellation and publication generations. `/cliproxyapi-refresh`, `/fast`, and Pi-initiated model refreshes all call this same lifecycle; they do not unregister or re-register the provider, so its OAuth, auth fallback, stream handler, and runtime identity stay intact.
 
 Use `/cliproxyapi-refresh` to force an immediate remote refresh of the model catalog.
 
 ### Refresh commands
 
-- `/cliproxyapi-refresh` — force an immediate remote refresh of the model catalog, rewrite the cache, and update registered models. Use this after adding or removing models on the proxy without restarting pi.
+- `/cliproxyapi-refresh` — ask pi to force the provider's native refresh callback, rewrite the cache, update the catalog, and reactivate the current model with fresh pricing/capability metadata. Use this after adding or removing models on the proxy without restarting pi.
 - `/login CLIProxyAPI` / `/login cliproxyapi` — re-entering credentials always forces a fresh models query and rewrites the cache.
 
 Delete `~/.pi/agent/cliproxyapi-models.json` to clear the cache manually.
