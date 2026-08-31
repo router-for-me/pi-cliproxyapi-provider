@@ -1,8 +1,13 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Api, Model } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { Api, Model, RefreshModelsContext } from "@earendil-works/pi-ai";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
+	ProviderConfig,
+} from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import providerExtension from "../extensions/index.ts";
 import {
@@ -104,19 +109,73 @@ async function withTempAgentDir(run: (agentDir: string) => Promise<void>): Promi
 	}
 }
 
-function createPiMock(commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>()): {
-	pi: ExtensionAPI;
-	commands: Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>;
-} {
+function createPiMock(commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>()) {
+	let providerConfig: ProviderConfig | undefined;
+	let refreshController: AbortController | undefined;
+	const sessionStartHandlers: Array<(event: unknown, ctx: ExtensionContext) => unknown> = [];
 	const pi = {
 		registerCommand: vi.fn((name: string, options: Parameters<ExtensionAPI["registerCommand"]>[1]) => {
 			commands.set(name, options);
 		}),
 		unregisterProvider: vi.fn(),
-		registerProvider: vi.fn(),
-		on: vi.fn(),
+		registerProvider: vi.fn((_providerId: string, config: ProviderConfig) => {
+			providerConfig = config;
+		}),
+		on: vi.fn((event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => {
+			if (event === "session_start") sessionStartHandlers.push(handler);
+		}),
+		setModel: vi.fn(async () => true),
 	} as unknown as ExtensionAPI;
-	return { pi, commands };
+
+	const models = (): Model<Api>[] =>
+		(providerConfig?.models ?? []).map((model) => ({
+			...model,
+			provider: "cliproxyapi",
+			api: providerConfig?.api ?? "openai-codex-responses",
+			baseUrl: providerConfig?.baseUrl ?? "http://127.0.0.1:8317/backend-api/",
+		})) as Model<Api>[];
+	const modelRegistry = {
+		refresh: vi.fn(async (options: { force?: boolean } = {}) => {
+			refreshController?.abort();
+			const controller = new AbortController();
+			refreshController = controller;
+			const errors = new Map<string, Error>();
+			const callback = providerConfig?.refreshModels;
+			if (callback) {
+				const run = async (allowNetwork: boolean): Promise<void> => {
+					const context: RefreshModelsContext = {
+						allowNetwork,
+						...(allowNetwork && options.force ? { force: true } : {}),
+						signal: controller.signal,
+						publish: async ({ update }) => {
+							if (controller.signal.aborted) return false;
+							update?.();
+							return true;
+						},
+					};
+					const refreshed = await callback(context);
+					if (!controller.signal.aborted && providerConfig) providerConfig.models = refreshed;
+				};
+				try {
+					await run(false);
+					if (!controller.signal.aborted) await run(true);
+				} catch (error) {
+					if (!controller.signal.aborted) {
+						errors.set("cliproxyapi", error instanceof Error ? error : new Error(String(error)));
+					}
+				}
+			}
+			return { aborted: controller.signal.aborted, errors };
+		}),
+		find: (providerId: string, modelId: string) =>
+			models().find((model) => model.provider === providerId && model.id === modelId),
+		getProvider: (providerId: string) => (providerId === "cliproxyapi" ? { getModels: models } : undefined),
+	};
+	const emitCatalogSessionStart = async (): Promise<void> => {
+		const ctx = { modelRegistry, ui: { notify: vi.fn() } } as unknown as ExtensionContext;
+		await sessionStartHandlers.at(-1)?.({ type: "session_start" }, ctx);
+	};
+	return { pi, commands, modelRegistry, emitCatalogSessionStart, getProviderConfig: () => providerConfig };
 }
 
 afterEach(() => {
@@ -381,33 +440,26 @@ describe("provider startup cache behavior", () => {
 				}
 				return remoteResponse;
 			});
-			const { pi, commands } = createPiMock();
+			const { pi, commands, emitCatalogSessionStart, getProviderConfig } = createPiMock();
 
 			try {
 				await expect(providerExtension(pi)).resolves.toBeUndefined();
-				expect(fetchMock).toHaveBeenCalledTimes(2);
+				expect(fetchMock).not.toHaveBeenCalled();
 				expect(commands.has("cliproxyapi-refresh")).toBe(true);
+				expect(getProviderConfig()?.models?.map((model) => model.id)).toEqual(["startup-cached"]);
+				expect(pi.registerProvider).toHaveBeenCalledTimes(1);
+				expect(pi.unregisterProvider).not.toHaveBeenCalled();
 
-				const initialCallsWithModels = (
-					(pi.registerProvider as ReturnType<typeof vi.fn>).mock.calls as Array<
-						[string, { models?: PiProviderModel[] }]
-					>
-				).filter(([, config]) => config.models && config.models.length > 0);
-				expect(initialCallsWithModels[0]?.[1].models?.map((model: PiProviderModel) => model.id)).toEqual([
-					"startup-cached",
-				]);
-
+				await emitCatalogSessionStart();
+				await new Promise<void>((resolve) => setTimeout(resolve, 0));
+				expect(fetchMock).toHaveBeenCalledTimes(2);
 				releaseRemote(
 					new Response(JSON.stringify({ models: [createCodexModel("background-fresh", true)] }), { status: 200 }),
 				);
 				await waitForAsyncRefresh();
 
-				const refreshedCallsWithModels = (
-					(pi.registerProvider as ReturnType<typeof vi.fn>).mock.calls as Array<
-						[string, { models?: PiProviderModel[] }]
-					>
-				).filter(([, config]) => config.models && config.models.length > 0);
-				expect(refreshedCallsWithModels.at(-1)?.[1].models?.[0].id).toBe("background-fresh");
+				expect(getProviderConfig()?.models?.[0]?.id).toBe("background-fresh");
+				expect(pi.registerProvider).toHaveBeenCalledTimes(1);
 				const diskCache = loadModelsCache(agentDir, "http://127.0.0.1:8317");
 				expect(diskCache?.models[0].id).toBe("background-fresh");
 				expect(diskCache?.fastModelIds).toEqual(["background-fresh"]);
@@ -436,13 +488,15 @@ describe("provider startup cache behavior", () => {
 				if (modelRequestCount === 1) return backgroundResponse;
 				return new Response(JSON.stringify({ models: [createCodexModel("newer")] }), { status: 200 });
 			});
-			const { pi, commands } = createPiMock();
+			const { pi, commands, modelRegistry, emitCatalogSessionStart, getProviderConfig } = createPiMock();
 
 			try {
 				await providerExtension(pi);
+				await emitCatalogSessionStart();
+				await new Promise<void>((resolve) => setTimeout(resolve, 0));
 				const refresh = commands.get("cliproxyapi-refresh")!;
 				const notify = vi.fn();
-				await refresh.handler("", { ui: { notify } } as unknown as ExtensionCommandContext);
+				await refresh.handler("", { modelRegistry, ui: { notify } } as unknown as ExtensionCommandContext);
 
 				const diskCacheAfterNewerRefresh = loadModelsCache(agentDir, "http://127.0.0.1:8317");
 				expect(diskCacheAfterNewerRefresh?.models[0]?.id).toBe("newer");
@@ -452,12 +506,8 @@ describe("provider startup cache behavior", () => {
 
 				const diskCacheAfterOlderRefresh = loadModelsCache(agentDir, "http://127.0.0.1:8317");
 				expect(diskCacheAfterOlderRefresh?.models[0]?.id).toBe("newer");
-				const callsWithModels = (
-					(pi.registerProvider as ReturnType<typeof vi.fn>).mock.calls as Array<
-						[string, { models?: PiProviderModel[] }]
-					>
-				).filter(([, config]) => config.models && config.models.length > 0);
-				expect(callsWithModels.at(-1)?.[1].models?.[0]?.id).toBe("newer");
+				expect(getProviderConfig()?.models?.[0]?.id).toBe("newer");
+				expect(pi.registerProvider).toHaveBeenCalledTimes(1);
 			} finally {
 				fetchMock.mockRestore();
 			}
@@ -471,19 +521,14 @@ describe("provider startup cache behavior", () => {
 			saveModelsCache(agentDir, cached, 1);
 
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network down"));
-			const { pi } = createPiMock();
+			const { pi, emitCatalogSessionStart, getProviderConfig } = createPiMock();
 
 			try {
 				await expect(providerExtension(pi)).resolves.toBeUndefined();
+				await emitCatalogSessionStart();
 				await waitForAsyncRefresh();
 				expect(fetchMock).toHaveBeenCalledTimes(2);
-
-				const callsWithModels = (
-					(pi.registerProvider as ReturnType<typeof vi.fn>).mock.calls as Array<
-						[string, { models?: PiProviderModel[] }]
-					>
-				).filter(([, config]) => config.models && config.models.length > 0);
-				expect(callsWithModels[0]?.[1].models?.[0].id).toBe("startup-fallback");
+				expect(getProviderConfig()?.models?.[0]?.id).toBe("startup-fallback");
 				const diskCache = loadModelsCache(agentDir, "http://127.0.0.1:8317");
 				expect(diskCache?.models[0].id).toBe("startup-fallback");
 			} finally {
@@ -543,19 +588,22 @@ describe("/cliproxyapi-refresh command", () => {
 						new Response(JSON.stringify({ models: [createCodexModel("refreshed", true)] }), { status: 200 }),
 					),
 				);
-			const { pi, commands } = createPiMock();
+			const { pi, commands, modelRegistry } = createPiMock();
 
 			try {
 				await providerExtension(pi);
 				const refresh = commands.get("cliproxyapi-refresh")!;
 				const notify = vi.fn();
 				const model = { id: "refreshed", provider: "cliproxyapi" } as Model<Api>;
-				const ctx = { model, ui: { notify } } as unknown as ExtensionCommandContext;
+				const ctx = { model, modelRegistry, ui: { notify } } as unknown as ExtensionCommandContext;
 
 				await refresh.handler("", ctx);
 
-				expect(fetchMock).toHaveBeenCalledTimes(4);
+				expect(fetchMock).toHaveBeenCalledTimes(2);
 				expect(notify).toHaveBeenCalledWith(expect.stringContaining("Refreshed 1 CLIProxyAPI models"), "info");
+				expect(pi.setModel).toHaveBeenCalledWith(expect.objectContaining({ id: "refreshed" }));
+				expect(pi.registerProvider).toHaveBeenCalledTimes(1);
+				expect(pi.unregisterProvider).not.toHaveBeenCalled();
 
 				const diskCache = loadModelsCache(agentDir, "http://127.0.0.1:8317");
 				expect(diskCache?.models[0].id).toBe("refreshed");
@@ -573,14 +621,14 @@ describe("/cliproxyapi-refresh command", () => {
 			const fetchMock = vi
 				.spyOn(globalThis, "fetch")
 				.mockResolvedValue(new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 }));
-			const { pi, commands } = createPiMock();
+			const { pi, commands, modelRegistry } = createPiMock();
 
 			try {
 				await providerExtension(pi);
 				const refresh = commands.get("cliproxyapi-refresh")!;
 				const notify = vi.fn();
 				const model = { id: "any", provider: "cliproxyapi" } as Model<Api>;
-				const ctx = { model, ui: { notify } } as unknown as ExtensionCommandContext;
+				const ctx = { model, modelRegistry, ui: { notify } } as unknown as ExtensionCommandContext;
 
 				await refresh.handler("", ctx);
 

@@ -5,6 +5,7 @@
  * - extractAccountId never throws; plain API keys are allowed
  * - chatgpt-account-id header is omitted when account id is unavailable
  * - provider id(s) are added to CODEX_TOOL_CALL_PROVIDERS for tool-call id handling
+ * - replayed duplicate tool-call identities are deterministically disambiguated
  * - model/message api id uses cliproxyapi-codex-responses
  *
  * The patched module is derived at runtime from the installed
@@ -40,6 +41,103 @@ export interface CliproxyCodexStreamOptions {
 
 type PayloadHook = NonNullable<SimpleStreamOptions["onPayload"]>;
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function allocateDuplicateIdentity(
+	original: string,
+	ordinal: number,
+	reserved: ReadonlySet<string>,
+	allocated: Set<string>,
+): string {
+	let candidateOrdinal = ordinal;
+	while (true) {
+		const suffix = `_pi_${candidateOrdinal}`;
+		const candidate = `${original.slice(0, 64 - suffix.length)}${suffix}`;
+		if (!reserved.has(candidate) && !allocated.has(candidate)) {
+			allocated.add(candidate);
+			return candidate;
+		}
+		candidateOrdinal++;
+	}
+}
+
+/**
+ * Make replayed Responses function-call identities unique while preserving each
+ * call/output pair. Upstream conversion has already flattened history here, so
+ * sequential pairing also covers synthetic outputs inserted for adjacent calls.
+ */
+export function normalizeResponsesToolCallIdentities(payload: unknown): unknown {
+	if (!isRecord(payload) || !Array.isArray(payload.input)) {
+		return payload;
+	}
+
+	const input = payload.input;
+	const reservedCallIds = new Set<string>();
+	const reservedItemIds = new Set<string>();
+	for (const item of input) {
+		if (!isRecord(item) || item.type !== "function_call") continue;
+		if (typeof item.call_id === "string") reservedCallIds.add(item.call_id);
+		if (typeof item.id === "string") reservedItemIds.add(item.id);
+	}
+
+	const callOccurrences = new Map<string, number>();
+	const itemOccurrences = new Map<string, number>();
+	const allocatedCallIds = new Set<string>();
+	const allocatedItemIds = new Set<string>();
+	const pendingCallIds = new Map<string, string[]>();
+	let changed = false;
+
+	const normalizedInput = input.map((item): unknown => {
+		if (!isRecord(item)) return item;
+
+		if (item.type === "function_call") {
+			const originalCallId = item.call_id;
+			const originalItemId = item.id;
+			let callId = originalCallId;
+			let itemId = originalItemId;
+
+			if (typeof originalCallId === "string") {
+				const ordinal = (callOccurrences.get(originalCallId) ?? 0) + 1;
+				callOccurrences.set(originalCallId, ordinal);
+				const pairedCallId =
+					ordinal === 1
+						? originalCallId
+						: allocateDuplicateIdentity(originalCallId, ordinal, reservedCallIds, allocatedCallIds);
+				callId = pairedCallId;
+				const pending = pendingCallIds.get(originalCallId) ?? [];
+				pending.push(pairedCallId);
+				pendingCallIds.set(originalCallId, pending);
+			}
+
+			if (typeof originalItemId === "string") {
+				const ordinal = (itemOccurrences.get(originalItemId) ?? 0) + 1;
+				itemOccurrences.set(originalItemId, ordinal);
+				if (ordinal > 1) {
+					itemId = allocateDuplicateIdentity(originalItemId, ordinal, reservedItemIds, allocatedItemIds);
+				}
+			}
+
+			if (callId === originalCallId && itemId === originalItemId) return item;
+			changed = true;
+			return { ...item, call_id: callId, id: itemId };
+		}
+
+		if (item.type === "function_call_output" && typeof item.call_id === "string") {
+			const callId = pendingCallIds.get(item.call_id)?.shift();
+			if (callId !== undefined && callId !== item.call_id) {
+				changed = true;
+				return { ...item, call_id: callId };
+			}
+		}
+
+		return item;
+	});
+
+	return changed ? { ...payload, input: normalizedInput } : payload;
+}
+
 export function withPriorityServiceTier(payload: unknown): unknown {
 	if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
 		return payload;
@@ -61,19 +159,22 @@ export async function applyFastPayloadHook(
 	return nextPayload === undefined ? fastPayload : nextPayload;
 }
 
-export function wrapStreamSimpleForFast(
+export function wrapCliproxyCodexStream(
 	streamSimple: CliproxyCodexStreamSimple,
 	shouldUseFast?: (model: Model<Api>) => boolean,
 ): CliproxyCodexStreamSimple {
-	return (model, context, streamOptions) => {
-		if (!shouldUseFast?.(model)) {
-			return streamSimple(model, context, streamOptions);
-		}
-		return streamSimple(model, context, {
+	return (model, context, streamOptions) =>
+		streamSimple(model, context, {
 			...streamOptions,
-			onPayload: (payload, payloadModel) => applyFastPayloadHook(payload, payloadModel, streamOptions?.onPayload),
+			onPayload: async (payload, payloadModel) => {
+				const normalizedPayload = normalizeResponsesToolCallIdentities(payload);
+				if (shouldUseFast?.(model)) {
+					return applyFastPayloadHook(normalizedPayload, payloadModel, streamOptions?.onPayload);
+				}
+				const nextPayload = await streamOptions?.onPayload?.(normalizedPayload, payloadModel);
+				return nextPayload === undefined ? normalizedPayload : nextPayload;
+			},
 		});
-	};
 }
 
 const EXTRACT_ACCOUNT_ID_PATCH = `function extractAccountId(token) {
@@ -284,11 +385,11 @@ export async function loadCliproxyCodexStreams(
 		throw new Error("patched openai-codex-responses module missing streamSimple/stream exports");
 	}
 
-	const streamSimple = wrapStreamSimpleForFast(mod.streamSimple, options.shouldUseFast);
+	const streamSimple = wrapCliproxyCodexStream(mod.streamSimple, options.shouldUseFast);
 
 	return {
 		api: CLIPROXYAPI_CODEX_API,
 		streamSimple,
-		stream: mod.stream,
+		stream: wrapCliproxyCodexStream(mod.stream),
 	};
 }

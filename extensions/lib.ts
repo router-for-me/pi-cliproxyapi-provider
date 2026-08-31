@@ -71,6 +71,8 @@ export interface CodexClientModel {
 	description?: string;
 	context_window?: number;
 	max_context_window?: number;
+	max_tokens?: number;
+	max_completion_tokens?: number;
 	input_modalities?: string[];
 	supported_reasoning_levels?: CodexReasoningLevel[] | string[];
 	default_service_tier?: string | null;
@@ -139,16 +141,26 @@ interface ModelsDevModePayload {
 
 interface ModelsDevModelPayload {
 	cost?: ModelsDevCostPayload;
+	limit?: {
+		context?: unknown;
+		output?: unknown;
+	};
 	experimental?: {
 		modes?: Record<string, ModelsDevModePayload | undefined>;
 	};
 }
 
+export interface CanonicalModelCapabilities {
+	contextWindow: number;
+	maxTokens: number;
+}
+
 export interface ModelsDevCostEntry {
 	providerId: string;
 	modelId: string;
-	standard: PiProviderCost;
+	standard?: PiProviderCost;
 	fast?: PiProviderCost;
+	capabilities?: CanonicalModelCapabilities;
 }
 
 export interface ModelsDevCostCatalog {
@@ -476,12 +488,7 @@ export function toPiModel(
 
 	const efforts = extractReasoningEfforts(model);
 	const hasReasoning = efforts.some((effort) => effort !== "none");
-	const contextWindow =
-		(typeof model.context_window === "number" && model.context_window > 0 ? model.context_window : undefined) ??
-		(typeof model.max_context_window === "number" && model.max_context_window > 0
-			? model.max_context_window
-			: undefined) ??
-		DEFAULT_CONTEXT_WINDOW;
+	const capabilities = resolveModelCapabilities(model, costCatalog);
 
 	const cost = costCatalog
 		? matchModelCost(id, costCatalog, fastMode && supportsFastServiceTier(model))
@@ -493,8 +500,7 @@ export function toPiModel(
 		reasoning: hasReasoning,
 		input: buildInputModalities(model),
 		cost,
-		contextWindow,
-		maxTokens: DEFAULT_MAX_TOKENS,
+		...capabilities,
 		thinkingLevelMap: buildThinkingLevelMap(efforts),
 	};
 }
@@ -583,8 +589,10 @@ const MODEL_PROVIDER_PREFERENCES: Array<{ pattern: RegExp; providers: string[] }
 	{ pattern: /^llama-/, providers: ["meta"] },
 ];
 
-/** Explicit aliases for proxy-specific model ids whose billable base model is known. */
-const MODEL_PRICE_ALIASES: Record<string, string[]> = {
+const MODEL_CAPABILITY_PROVIDER_PREFERENCES = [{ pattern: /^(?:kimi-|moonshot-)/, providers: ["neon"] }];
+
+/** Explicit aliases for proxy-specific ids with a confirmed canonical model. */
+const MODEL_CANONICAL_ALIASES: Record<string, string[]> = {
 	"gemini-pro-agent": ["gemini-3.1-pro-preview"],
 	"gemini-3.1-pro-low": ["gemini-3.1-pro-preview"],
 	"gemini-3.6-flash-high": ["gemini-3.6-flash"],
@@ -685,6 +693,13 @@ function preferredProvidersForModel(modelId: string): string[] {
 	return uniqueStrings([namespace ?? "", ...familyProviders]);
 }
 
+function preferredCapabilityProviders(modelId: string): string[] {
+	const normalizedId = stripModelNamespace(modelId);
+	const canonical =
+		MODEL_CAPABILITY_PROVIDER_PREFERENCES.find(({ pattern }) => pattern.test(normalizedId))?.providers ?? [];
+	return uniqueStrings([...canonical, ...preferredProvidersForModel(modelId)]);
+}
+
 function addCatalogEntry(catalog: Map<string, ModelsDevCostEntry[]>, key: string, entry: ModelsDevCostEntry): void {
 	if (!key) return;
 	const entries = catalog.get(key) ?? [];
@@ -726,20 +741,81 @@ function findDirectModelsDevEntry(modelId: string, catalog: ModelsDevCostCatalog
 	const rawId = modelId.trim().toLowerCase();
 	const exactKeys = uniqueStrings([rawId, stripModelNamespace(rawId)]);
 	for (const key of exactKeys) {
-		const match = selectModelsDevEntry(catalog.exact.get(key) ?? [], modelId);
+		const entries = (catalog.exact.get(key) ?? []).filter((entry) => entry.standard !== undefined);
+		const match = selectModelsDevEntry(entries, modelId);
 		if (match) return match;
 	}
-	return selectModelsDevEntry(catalog.normalized.get(normalizeModelKey(rawId)) ?? [], modelId);
+	const normalizedEntries = (catalog.normalized.get(normalizeModelKey(rawId)) ?? []).filter(
+		(entry) => entry.standard !== undefined,
+	);
+	return selectModelsDevEntry(normalizedEntries, modelId);
 }
 
 function findModelsDevEntry(modelId: string, catalog: ModelsDevCostCatalog): ModelsDevCostEntry | undefined {
 	const rawId = modelId.trim().toLowerCase();
-	const lookupIds = uniqueStrings([rawId, ...(MODEL_PRICE_ALIASES[rawId] ?? [])]);
+	const lookupIds = uniqueStrings([rawId, ...(MODEL_CANONICAL_ALIASES[rawId] ?? [])]);
 	for (const lookupId of lookupIds) {
 		const match = findDirectModelsDevEntry(lookupId, catalog);
 		if (match) return match;
 	}
 	return undefined;
+}
+
+function sameCapabilityVariants(entries: ModelsDevCostEntry[]): boolean {
+	return new Set(entries.map((entry) => JSON.stringify(entry.capabilities))).size === 1;
+}
+
+function findCanonicalCapabilityEntry(modelId: string, catalog: ModelsDevCostCatalog): ModelsDevCostEntry | undefined {
+	const rawId = modelId.trim().toLowerCase();
+	const lookupIds = uniqueStrings([rawId, ...(MODEL_CANONICAL_ALIASES[rawId] ?? [])]);
+	for (const lookupId of lookupIds) {
+		const exactKeys = uniqueStrings([lookupId, stripModelNamespace(lookupId)]);
+		for (const key of exactKeys) {
+			const entries = (catalog.exact.get(key) ?? []).filter((entry) => entry.capabilities !== undefined);
+			const preferredProviders = preferredCapabilityProviders(lookupId);
+			for (const providerId of preferredProviders) {
+				const preferred = entries.find((entry) => entry.providerId === providerId);
+				if (preferred) return preferred;
+			}
+			if (entries.length === 1 || sameCapabilityVariants(entries)) {
+				return [...entries].sort((a, b) => a.providerId.localeCompare(b.providerId))[0];
+			}
+		}
+	}
+	return undefined;
+}
+
+const CLIPROXY_SYNTHETIC_CONTEXT_WINDOW = 272_000;
+
+function positiveNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/**
+ * Capability priority: explicit non-template CLIProxy values, exact/known-alias
+ * canonical metadata, then conservative defaults. The 272K template is retained
+ * only when the canonical price catalog confirms an intentional 272K tier.
+ */
+export function resolveModelCapabilities(
+	model: CodexClientModel,
+	catalog?: ModelsDevCostCatalog,
+): CanonicalModelCapabilities {
+	const id = codexModelId(model);
+	const canonical = id && catalog ? findCanonicalCapabilityEntry(id, catalog) : undefined;
+	const serverContext = positiveNumber(model.context_window) ?? positiveNumber(model.max_context_window);
+	const isSyntheticTemplate =
+		serverContext === CLIPROXY_SYNTHETIC_CONTEXT_WINDOW &&
+		positiveNumber(model.context_window) === CLIPROXY_SYNTHETIC_CONTEXT_WINDOW &&
+		positiveNumber(model.max_context_window) === CLIPROXY_SYNTHETIC_CONTEXT_WINDOW;
+	const hasMatchingContextTier =
+		canonical?.standard?.tiers?.some((tier) => tier.inputTokensAbove === CLIPROXY_SYNTHETIC_CONTEXT_WINDOW) ?? false;
+	const trustedServerContext = !isSyntheticTemplate || hasMatchingContextTier ? serverContext : undefined;
+	const serverMaxTokens = positiveNumber(model.max_completion_tokens) ?? positiveNumber(model.max_tokens);
+
+	return {
+		contextWindow: trustedServerContext ?? canonical?.capabilities?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+		maxTokens: serverMaxTokens ?? canonical?.capabilities?.maxTokens ?? DEFAULT_MAX_TOKENS,
+	};
 }
 
 interface ModelsDevCacheFile {
@@ -796,9 +872,13 @@ function buildCatalogFromProviders(providers: Record<string, unknown>): ModelsDe
 		for (const [modelId, modelValue] of Object.entries(models)) {
 			const model = asRecord(modelValue) as ModelsDevModelPayload | undefined;
 			const standard = parseModelsDevCost(model?.cost);
-			if (!standard) continue;
 			const fast = parseModelsDevCost(model?.experimental?.modes?.fast?.cost);
-			addModelsDevEntry(catalog, { providerId, modelId, standard, fast });
+			const contextWindow = positiveNumber(model?.limit?.context);
+			const maxTokens = positiveNumber(model?.limit?.output);
+			const capabilities =
+				contextWindow !== undefined && maxTokens !== undefined ? { contextWindow, maxTokens } : undefined;
+			if (!standard && !capabilities) continue;
+			addModelsDevEntry(catalog, { providerId, modelId, standard, fast, capabilities });
 		}
 	}
 	return catalog;
@@ -843,8 +923,8 @@ export async function fetchModelsDevCostMap(
 
 export function matchModelCost(modelId: string, costCatalog: ModelsDevCostCatalog, isFastMode = false): PiProviderCost {
 	const entry = findModelsDevEntry(modelId, costCatalog);
-	if (!entry) return { ...ZERO_COST };
-	return cloneCost(isFastMode && entry.fast ? entry.fast : entry.standard);
+	const cost = isFastMode && entry?.fast ? entry.fast : entry?.standard;
+	return cost ? cloneCost(cost) : { ...ZERO_COST };
 }
 
 export async function loadMappedModels(

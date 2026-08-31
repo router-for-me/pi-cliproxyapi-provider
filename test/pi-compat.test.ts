@@ -1,8 +1,13 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Api, Model } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { Api, Model, RefreshModelsContext } from "@earendil-works/pi-ai";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
+	ProviderConfig,
+} from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import providerExtension from "../extensions/index.ts";
 import { AUTH_FILE_NAME } from "../extensions/lib.ts";
@@ -44,6 +49,21 @@ async function withTempAgentDir(run: (agentDir: string) => Promise<void>): Promi
 function createPiMock(commands: Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>) {
 	const handlers = new Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>();
 	const registeredModels = new Map<string, Model<Api>>();
+	let providerConfig: ProviderConfig | undefined;
+	let refreshController: AbortController | undefined;
+	const installModels = (providerId: string, config: ProviderConfig, models = config.models ?? []): void => {
+		for (const key of registeredModels.keys()) {
+			if (key.startsWith(`${providerId}/`)) registeredModels.delete(key);
+		}
+		for (const model of models) {
+			registeredModels.set(`${providerId}/${model.id}`, {
+				...model,
+				provider: providerId,
+				api: config.api as Api,
+				baseUrl: config.baseUrl as string,
+			});
+		}
+	};
 	const pi = {
 		registerCommand: vi.fn((name: string, options: Parameters<ExtensionAPI["registerCommand"]>[1]) => {
 			commands.set(name, options);
@@ -53,17 +73,9 @@ function createPiMock(commands: Map<string, Parameters<ExtensionAPI["registerCom
 				if (key.startsWith(`${providerId}/`)) registeredModels.delete(key);
 			}
 		}),
-		registerProvider: vi.fn((providerId: string, config: Record<string, unknown>) => {
-			const models = Array.isArray(config.models) ? config.models : [];
-			for (const model of models) {
-				const entry = model as Model<Api>;
-				registeredModels.set(`${providerId}/${entry.id}`, {
-					...entry,
-					provider: providerId,
-					api: config.api as Api,
-					baseUrl: config.baseUrl as string,
-				});
-			}
+		registerProvider: vi.fn((providerId: string, config: ProviderConfig) => {
+			providerConfig = config;
+			installModels(providerId, config);
 		}),
 		setModel: vi.fn(async () => true),
 		on: vi.fn((event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => {
@@ -71,16 +83,53 @@ function createPiMock(commands: Map<string, Parameters<ExtensionAPI["registerCom
 		}),
 	} as unknown as ExtensionAPI;
 	const modelRegistry = {
+		refresh: vi.fn(async (options: { force?: boolean } = {}) => {
+			refreshController?.abort();
+			const controller = new AbortController();
+			refreshController = controller;
+			const errors = new Map<string, Error>();
+			const callback = providerConfig?.refreshModels;
+			if (callback && providerConfig) {
+				const run = async (allowNetwork: boolean): Promise<void> => {
+					const context: RefreshModelsContext = {
+						allowNetwork,
+						...(allowNetwork && options.force ? { force: true } : {}),
+						signal: controller.signal,
+						publish: async ({ update }) => {
+							if (controller.signal.aborted) return false;
+							update?.();
+							return true;
+						},
+					};
+					const models = await callback(context);
+					if (!controller.signal.aborted && providerConfig) {
+						providerConfig.models = models;
+						installModels("cliproxyapi", providerConfig, models);
+					}
+				};
+				try {
+					await run(false);
+					if (!controller.signal.aborted) await run(true);
+				} catch (error) {
+					if (!controller.signal.aborted) {
+						errors.set("cliproxyapi", error instanceof Error ? error : new Error(String(error)));
+					}
+				}
+			}
+			return { aborted: controller.signal.aborted, errors };
+		}),
 		find: (providerId: string, modelId: string) => registeredModels.get(`${providerId}/${modelId}`),
+		getProvider: (providerId: string) =>
+			providerId === "cliproxyapi" ? { getModels: () => [...registeredModels.values()] } : undefined,
 	};
-	return { pi, handlers, modelRegistry, registeredModels };
+	return { pi, handlers, modelRegistry, registeredModels, getProviderConfig: () => providerConfig };
 }
 
-describe("pi 0.82.0 compatibility", () => {
+describe("pi 0.84.3 native model refresh compatibility", () => {
 	it("registers oauth login and /fast without a dedicated /cliproxyapi command", async () => {
 		await withTempAgentDir(async () => {
 			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
-			const { pi } = createPiMock(commands);
+			const { pi, getProviderConfig } = createPiMock(commands);
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
 				new Response(JSON.stringify({ models: [] }), {
 					status: 200,
@@ -98,18 +147,59 @@ describe("pi 0.82.0 compatibility", () => {
 				expect(commands.has("continue")).toBe(true);
 				expect(commands.has("cliproxyapi-refresh")).toBe(true);
 				expect(commands.has("cliproxyapi")).toBe(false);
-				expect(pi.unregisterProvider).toHaveBeenCalledWith("cliproxyapi");
+				expect(pi.unregisterProvider).not.toHaveBeenCalled();
+				expect(pi.registerProvider).toHaveBeenCalledTimes(1);
 				expect(pi.registerProvider).toHaveBeenCalledWith(
 					"cliproxyapi",
 					expect.objectContaining({
 						name: "CLIProxyAPI",
 						oauth: expect.any(Object),
+						refreshModels: expect.any(Function),
 					}),
 				);
+				expect(getProviderConfig()?.refreshModels).toBeTypeOf("function");
 				// OAuth-only registration keeps `/login cliproxyapi` off the API-key selector.
 				for (const [, config] of (pi.registerProvider as ReturnType<typeof vi.fn>).mock.calls) {
 					expect(config).not.toHaveProperty("apiKey");
 				}
+			} finally {
+				fetchMock.mockRestore();
+			}
+		});
+	});
+
+	it("keeps /login on the OAuth multi-field flow and refreshes without re-registering", async () => {
+		await withTempAgentDir(async () => {
+			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const { pi, getProviderConfig } = createPiMock(commands);
+			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+				if (String(input).startsWith("https://models.dev/")) {
+					return new Response("{}", { status: 200 });
+				}
+				return new Response(JSON.stringify({ models: [{ slug: "login-refreshed" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			try {
+				await providerExtension(pi);
+				const oauth = getProviderConfig()?.oauth;
+				if (!oauth) throw new Error("OAuth provider was not registered");
+				const onPrompt = vi.fn().mockResolvedValueOnce("http://127.0.0.1:8317").mockResolvedValueOnce("login-key");
+				const credential = await oauth.login({
+					onAuth: vi.fn(),
+					onDeviceCode: vi.fn(),
+					onPrompt,
+					onProgress: vi.fn(),
+					onSelect: vi.fn(),
+				});
+
+				expect(onPrompt).toHaveBeenCalledTimes(2);
+				expect(credential.access).toBe("login-key");
+				expect(getProviderConfig()?.models?.map((model) => model.id)).toEqual(["login-refreshed"]);
+				expect(pi.registerProvider).toHaveBeenCalledTimes(1);
+				expect(pi.unregisterProvider).not.toHaveBeenCalled();
 			} finally {
 				fetchMock.mockRestore();
 			}
@@ -185,6 +275,8 @@ describe("pi 0.82.0 compatibility", () => {
 						cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
 					}),
 				);
+				expect(pi.registerProvider).toHaveBeenCalledTimes(1);
+				expect(pi.unregisterProvider).not.toHaveBeenCalled();
 			} finally {
 				fetchMock.mockRestore();
 			}
