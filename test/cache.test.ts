@@ -162,7 +162,23 @@ describe("models cache helpers", () => {
 
 		expect(loadModelsCache(agentDir, "127.0.0.1:8317")).toEqual({ ...loaded, fetchedAt });
 		expect(loadModelsCache(agentDir, "http://127.0.0.1:8317/")).toEqual({ ...loaded, fetchedAt });
-		expect(loadModelsCache(agentDir, "http://127.0.0.1:8317/v1")).toEqual({ ...loaded, fetchedAt });
+		expect(loadModelsCache(agentDir, "http://127.0.0.1:8317/backend-api")).toEqual({ ...loaded, fetchedAt });
+	});
+
+	it("matches cache across equivalent openai-responses baseUrl forms", () => {
+		const agentDir = tempAgentDir();
+		const endpoints = resolveEndpoints("http://relay.api/v1", "openai-responses");
+		const loaded: MappedModels = {
+			models: [createModel("m1")],
+			fastModelIds: [],
+			inferenceBaseUrl: endpoints.inferenceBaseUrl,
+			modelsUrl: endpoints.modelsUrl,
+		};
+		const fetchedAt = Date.now();
+		saveModelsCache(agentDir, loaded, fetchedAt);
+
+		expect(loadModelsCache(agentDir, "http://relay.api/v1")).toEqual({ ...loaded, fetchedAt });
+		expect(loadModelsCache(agentDir, "http://relay.api/v1/")).toEqual({ ...loaded, fetchedAt });
 	});
 
 	it("writes pretty-printed JSON to disk", () => {
