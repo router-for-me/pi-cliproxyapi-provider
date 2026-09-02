@@ -110,6 +110,44 @@ describe("pi 0.82.0 compatibility", () => {
 		});
 	});
 
+	it("re-registers in place on hosts without unregisterProvider", async () => {
+		await withTempAgentDir(async (agentDir) => {
+			writeFileSync(
+				join(agentDir, "cliproxyapi.json"),
+				JSON.stringify({ baseUrl: "http://127.0.0.1:8317", apiKey: "ambient-key" }),
+				"utf8",
+			);
+
+			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const { pi } = createPiMock(commands);
+			Reflect.deleteProperty(pi as object, "unregisterProvider");
+			const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+				new Response(JSON.stringify({ models: [] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+
+			try {
+				await expect(providerExtension(pi)).resolves.toBeUndefined();
+				const registerCallsAfterLoad = (pi.registerProvider as ReturnType<typeof vi.fn>).mock.calls.length;
+				expect(registerCallsAfterLoad).toBeGreaterThan(0);
+				expect("unregisterProvider" in pi).toBe(false);
+
+				const refresh = commands.get("cliproxyapi-refresh");
+				if (!refresh) throw new Error("cliproxyapi-refresh command is unavailable");
+				await refresh.handler("", { ui: { notify: vi.fn() } } as unknown as ExtensionCommandContext);
+
+				// Without unregisterProvider the host cannot replace; refresh only
+				// re-registers. Stale merged fields are a documented host limitation.
+				expect(pi.registerProvider).toHaveBeenCalledTimes(registerCallsAfterLoad + 1);
+				expect("unregisterProvider" in pi).toBe(false);
+			} finally {
+				fetchMock.mockRestore();
+			}
+		});
+	});
+
 	it("registers oauth login and /fast without a dedicated /cliproxyapi command", async () => {
 		await withTempAgentDir(async () => {
 			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();

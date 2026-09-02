@@ -362,10 +362,15 @@ function registerProvider(
 		onFastModeChange,
 	});
 
-	// Replace any previous registration so an earlier ambient apiKey does not linger
-	// via registerProvider merge semantics and reintroduce the auth-type selector.
-	// Compatible hosts such as Oh My Pi may not expose unregisterProvider yet;
-	// their startup registration is still safe because no previous provider exists.
+	// Prefer replace: drop the previous registration so an earlier ambient apiKey
+	// cannot linger via registerProvider merge semantics and reintroduce the
+	// auth-type selector. This path runs on startup, /login, /cliproxyapi-refresh,
+	// and Fast-triggered catalog updates — not only first load.
+	// Hosts without unregisterProvider (current Oh My Pi) have no API to clear
+	// those merge fields. Do not invent an unregister. Re-register in place:
+	// first startup is still a clean insert; later refresh/login cannot drop
+	// stale fields the host already merged (restart the host after switching
+	// from config/env apiKey to /login credentials if the selector reappears).
 	if (typeof pi.unregisterProvider === "function") {
 		pi.unregisterProvider(providerId);
 	}

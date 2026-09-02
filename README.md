@@ -32,6 +32,8 @@ pi -e /absolute/path/to/pi-cliproxyapi-provider
 
 Below, `<agent-dir>` means `~/.pi/agent` for Pi or `~/.omp/agent` for OMP.
 
+Compatible-host limitation: Pi exposes `unregisterProvider`, so refresh and `/login` replace the prior registration. Current Oh My Pi does not; this extension re-registers in place and cannot clear stale merged fields (for example a previously registered ambient `apiKey`). Restart OMP after switching from config/env `apiKey` to `/login` credentials if the auth-type selector reappears.
+
 ## Login-style setup (recommended)
 
 This plugin needs both **baseUrl** and **apiKey**. The host's built-in `/login` uses the account/OAuth path for multi-field prompts, so CLIProxyAPI appears under **Sign in with an account** (not API key).
@@ -239,7 +241,7 @@ Disable just this helper via `pi config` or `omp config` if you only want the CL
 
 - CLIProxyAPI `closed network connection` responses are normalized as transient network errors so pi's agent-level retry policy reconnects and restarts the interrupted assistant turn. Completed conversation and tool results remain available; token streaming does not resume from the exact interruption point.
 - Before setup / without credentials: provider still appears in `/login`; no models are listed yet.
-- After successful `/login`: models are registered; credentials are stored in `auth.json` and mirrored to `cliproxyapi.json`.
+- After successful `/login`: models are registered; credentials are stored in `auth.json` and mirrored to `cliproxyapi.json`. On hosts without `unregisterProvider` (current Oh My Pi), this is a re-register, not a replace; stale merged fields are not cleared.
 - The built-in `/logout` command removes only the matching `auth.json` credential; environment variables and `cliproxyapi.json` are unchanged.
 - If a models request returns **HTTP 401** or CPA is unreachable during startup, an existing matching cache remains in use while the background refresh fails. Only when no cache is available is a warning logged; reconfigure via `/login CLIProxyAPI` or fix config/env.
 - Login final step validates credentials by requesting models:
