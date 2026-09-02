@@ -1,9 +1,10 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessageEventStream, Context, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
+import { type CliproxyCodexStreamSimple, wrapStreamSimpleForFast } from "../extensions/codex-stream.ts";
 import providerExtension from "../extensions/index.ts";
 import { AUTH_FILE_NAME } from "../extensions/lib.ts";
 
@@ -77,6 +78,76 @@ function createPiMock(commands: Map<string, Parameters<ExtensionAPI["registerCom
 }
 
 describe("pi 0.82.0 compatibility", () => {
+	it("normalizes OMP system prompt arrays before invoking the Pi Codex stream", () => {
+		const eventStream = {} as AssistantMessageEventStream;
+		const delegate = vi.fn(() => eventStream) as unknown as CliproxyCodexStreamSimple;
+		const wrapped = wrapStreamSimpleForFast(delegate);
+		const model = { id: "gpt-5.6-sol", provider: "cliproxyapi" } as Model<Api>;
+		const context = {
+			systemPrompt: ["first instruction", "second instruction"],
+			messages: [],
+		} as unknown as Context;
+
+		expect(wrapped(model, context)).toBe(eventStream);
+		expect(delegate).toHaveBeenCalledWith(
+			model,
+			{ ...context, systemPrompt: "first instruction\n\nsecond instruction" },
+			undefined,
+		);
+	});
+
+	it("loads on compatible hosts that do not implement unregisterProvider", async () => {
+		await withTempAgentDir(async () => {
+			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const { pi } = createPiMock(commands);
+			Reflect.deleteProperty(pi as object, "unregisterProvider");
+
+			await expect(providerExtension(pi)).resolves.toBeUndefined();
+			expect(pi.registerProvider).toHaveBeenCalledWith(
+				"cliproxyapi",
+				expect.objectContaining({ name: "CLIProxyAPI" }),
+			);
+		});
+	});
+
+	it("re-registers in place on hosts without unregisterProvider", async () => {
+		await withTempAgentDir(async (agentDir) => {
+			writeFileSync(
+				join(agentDir, "cliproxyapi.json"),
+				JSON.stringify({ baseUrl: "http://127.0.0.1:8317", apiKey: "ambient-key" }),
+				"utf8",
+			);
+
+			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const { pi } = createPiMock(commands);
+			Reflect.deleteProperty(pi as object, "unregisterProvider");
+			const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+				new Response(JSON.stringify({ models: [] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+
+			try {
+				await expect(providerExtension(pi)).resolves.toBeUndefined();
+				const registerCallsAfterLoad = (pi.registerProvider as ReturnType<typeof vi.fn>).mock.calls.length;
+				expect(registerCallsAfterLoad).toBeGreaterThan(0);
+				expect("unregisterProvider" in pi).toBe(false);
+
+				const refresh = commands.get("cliproxyapi-refresh");
+				if (!refresh) throw new Error("cliproxyapi-refresh command is unavailable");
+				await refresh.handler("", { ui: { notify: vi.fn() } } as unknown as ExtensionCommandContext);
+
+				// Without unregisterProvider the host cannot replace; refresh only
+				// re-registers. Stale merged fields are a documented host limitation.
+				expect(pi.registerProvider).toHaveBeenCalledTimes(registerCallsAfterLoad + 1);
+				expect("unregisterProvider" in pi).toBe(false);
+			} finally {
+				fetchMock.mockRestore();
+			}
+		});
+	});
+
 	it("registers oauth login and /fast without a dedicated /cliproxyapi command", async () => {
 		await withTempAgentDir(async () => {
 			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();

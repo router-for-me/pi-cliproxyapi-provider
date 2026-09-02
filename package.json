@@ -1,11 +1,13 @@
 {
 	"name": "@router-for-me/pi-cliproxyapi-provider",
 	"version": "1.4.15",
-	"description": "Pi provider extension that auto-registers CLIProxyAPI models, plus TUI elapsed/TPS status",
+	"description": "Pi and Oh My Pi provider extension that auto-registers CLIProxyAPI models, plus TUI elapsed/TPS status",
 	"type": "module",
 	"keywords": [
 		"pi-package",
 		"pi-extension",
+		"omp-plugin",
+		"oh-my-pi",
 		"cliproxyapi",
 		"tps"
 	],
@@ -32,6 +34,12 @@
 		"check": "npm run typecheck && npm run lint && npm run test"
 	},
 	"pi": {
+		"extensions": [
+			"./extensions/index.ts",
+			"./extensions/tps.ts"
+		]
+	},
+	"omp": {
 		"extensions": [
 			"./extensions/index.ts",
 			"./extensions/tps.ts"
