@@ -1,6 +1,7 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { pauseController } from "./pause.ts";
+import { formatGatewayTokensPerSecond, wrapFetchCaptureTokensPerSecond } from "./gateway-telemetry.ts";
 
 const STATUS_KEY = "tps";
 const REFRESH_INTERVAL_MS = 1000;
@@ -32,6 +33,8 @@ export default function (pi: ExtensionAPI) {
 	let cacheRead = 0;
 	let cacheWrite = 0;
 	let totalTokens = 0;
+	let capturedTokensPerSecond: number | undefined;
+	let restoreFetch: (() => void) | undefined;
 
 	function clearRefreshTimer(): void {
 		if (refreshTimer === undefined) return;
@@ -119,6 +122,18 @@ export default function (pi: ExtensionAPI) {
 		cacheRead = 0;
 		cacheWrite = 0;
 		totalTokens = 0;
+		capturedTokensPerSecond = undefined;
+		if (!restoreFetch) {
+			const originalFetch = globalThis.fetch;
+			globalThis.fetch = wrapFetchCaptureTokensPerSecond((input, init) => {
+				return originalFetch.call(globalThis, input, init);
+			}, (tpsValue) => {
+				capturedTokensPerSecond = tpsValue;
+			});
+			restoreFetch = () => {
+				globalThis.fetch = originalFetch;
+			};
+		}
 		refreshStatus();
 
 		clearRefreshTimer();
@@ -156,9 +171,10 @@ export default function (pi: ExtensionAPI) {
 		setElapsedStatus(ctx, elapsedSecondsFloor);
 		statusCtx = ctx;
 
+		const tps = formatGatewayTokensPerSecond(capturedTokensPerSecond);
+		restoreFetch?.();
+		restoreFetch = undefined;
 		if (elapsedMs <= 0) return;
-
-		const tps = output > 0 ? (output / elapsedSecondsExact).toFixed(1) : "--";
 		const message = `TPS ${tps} tok/s. out ${output.toLocaleString()}, in ${input.toLocaleString()}, cache r/w ${cacheRead.toLocaleString()}/${cacheWrite.toLocaleString()}, total ${totalTokens.toLocaleString()}, ${elapsedSecondsExact.toFixed(1)}s`;
 		ctx.ui.notify(message, "info");
 	});
@@ -170,5 +186,8 @@ export default function (pi: ExtensionAPI) {
 		pausedDurationAtStartMs = 0;
 		pauseWasEnabledAtStart = false;
 		statusCtx = null;
+		restoreFetch?.();
+		restoreFetch = undefined;
+		capturedTokensPerSecond = undefined;
 	});
 }
