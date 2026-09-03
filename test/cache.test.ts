@@ -79,6 +79,18 @@ async function waitForAsyncRefresh(): Promise<void> {
 	}
 }
 
+async function waitForMockCalls(
+	mock: { mock: { calls: unknown[] } },
+	count: number,
+	timeoutMs = 3000,
+): Promise<void> {
+	const started = Date.now();
+	while (mock.mock.calls.length < count) {
+		if (Date.now() - started >= timeoutMs) return;
+		await new Promise<void>((resolve) => setTimeout(resolve, 10));
+	}
+}
+
 async function withTempAgentDir(run: (agentDir: string) => Promise<void>): Promise<void> {
 	const agentDir = tempAgentDir();
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -350,7 +362,7 @@ describe("provider startup cache behavior", () => {
 
 			try {
 				const startup = providerExtension(pi);
-				await waitForAsyncRefresh();
+				await waitForMockCalls(fetchMock, 2);
 				expect(fetchMock).toHaveBeenCalledTimes(2);
 				releaseRemote(
 					new Response(JSON.stringify({ models: [createCodexModel("startup-remote")] }), { status: 200 }),

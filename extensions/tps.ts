@@ -124,8 +124,10 @@ export default function (pi: ExtensionAPI) {
 		totalTokens = 0;
 		capturedTokensPerSecond = undefined;
 		if (!restoreFetch) {
-			const originalFetch = globalThis.fetch.bind(globalThis);
-			globalThis.fetch = wrapFetchCaptureTokensPerSecond(originalFetch, (tpsValue) => {
+			const originalFetch = globalThis.fetch;
+			globalThis.fetch = wrapFetchCaptureTokensPerSecond((input, init) => {
+				return originalFetch.call(globalThis, input, init);
+			}, (tpsValue) => {
 				capturedTokensPerSecond = tpsValue;
 			});
 			restoreFetch = () => {
