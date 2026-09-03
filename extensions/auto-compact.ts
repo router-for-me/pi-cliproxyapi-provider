@@ -76,7 +76,8 @@ export class ProactiveCompactionController {
 	register(pi: ExtensionAPI): void {
 		pi.on("session_start", (_event, ctx) => {
 			this.settingsManager = SettingsManager.create(ctx.cwd, this.agentDir, {
-				projectTrusted: ctx.isProjectTrusted(),
+				projectTrusted:
+					typeof ctx.isProjectTrusted === "function" ? ctx.isProjectTrusted() : true,
 			});
 			this.pending = undefined;
 		});
