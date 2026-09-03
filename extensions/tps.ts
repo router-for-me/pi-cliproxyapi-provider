@@ -1,6 +1,7 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { pauseController } from "./pause.ts";
+import { formatGatewayTokensPerSecond, tokensPerSecondFromUsage } from "./gateway-telemetry.ts";
 
 const STATUS_KEY = "tps";
 const REFRESH_INTERVAL_MS = 1000;
@@ -32,6 +33,7 @@ export default function (pi: ExtensionAPI) {
 	let cacheRead = 0;
 	let cacheWrite = 0;
 	let totalTokens = 0;
+	const gatewayUsages: unknown[] = [];
 
 	function clearRefreshTimer(): void {
 		if (refreshTimer === undefined) return;
@@ -119,6 +121,7 @@ export default function (pi: ExtensionAPI) {
 		cacheRead = 0;
 		cacheWrite = 0;
 		totalTokens = 0;
+		gatewayUsages.length = 0;
 		refreshStatus();
 
 		clearRefreshTimer();
@@ -137,6 +140,9 @@ export default function (pi: ExtensionAPI) {
 			cacheRead += message.usage.cacheRead || 0;
 			cacheWrite += message.usage.cacheWrite || 0;
 			totalTokens += message.usage.totalTokens || 0;
+			if (tokensPerSecondFromUsage(message.usage) !== undefined) {
+				gatewayUsages.push(message.usage);
+			}
 		}
 	});
 
@@ -158,7 +164,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (elapsedMs <= 0) return;
 
-		const tps = output > 0 ? (output / elapsedSecondsExact).toFixed(1) : "--";
+		const tps = formatGatewayTokensPerSecond(gatewayUsages);
 		const message = `TPS ${tps} tok/s. out ${output.toLocaleString()}, in ${input.toLocaleString()}, cache r/w ${cacheRead.toLocaleString()}/${cacheWrite.toLocaleString()}, total ${totalTokens.toLocaleString()}, ${elapsedSecondsExact.toFixed(1)}s`;
 		ctx.ui.notify(message, "info");
 	});
