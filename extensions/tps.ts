@@ -1,7 +1,7 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { pauseController } from "./pause.ts";
-import { formatGatewayTokensPerSecond, tokensPerSecondFromUsage } from "./gateway-telemetry.ts";
+import { formatGatewayTokensPerSecond, wrapFetchCaptureTokensPerSecond } from "./gateway-telemetry.ts";
 
 const STATUS_KEY = "tps";
 const REFRESH_INTERVAL_MS = 1000;
@@ -33,7 +33,8 @@ export default function (pi: ExtensionAPI) {
 	let cacheRead = 0;
 	let cacheWrite = 0;
 	let totalTokens = 0;
-	const gatewayUsages: unknown[] = [];
+	let capturedTokensPerSecond: number | undefined;
+	let restoreFetch: (() => void) | undefined;
 
 	function clearRefreshTimer(): void {
 		if (refreshTimer === undefined) return;
@@ -121,7 +122,16 @@ export default function (pi: ExtensionAPI) {
 		cacheRead = 0;
 		cacheWrite = 0;
 		totalTokens = 0;
-		gatewayUsages.length = 0;
+		capturedTokensPerSecond = undefined;
+		if (!restoreFetch) {
+			const originalFetch = globalThis.fetch.bind(globalThis);
+			globalThis.fetch = wrapFetchCaptureTokensPerSecond(originalFetch, (tpsValue) => {
+				capturedTokensPerSecond = tpsValue;
+			});
+			restoreFetch = () => {
+				globalThis.fetch = originalFetch;
+			};
+		}
 		refreshStatus();
 
 		clearRefreshTimer();
@@ -140,9 +150,6 @@ export default function (pi: ExtensionAPI) {
 			cacheRead += message.usage.cacheRead || 0;
 			cacheWrite += message.usage.cacheWrite || 0;
 			totalTokens += message.usage.totalTokens || 0;
-			if (tokensPerSecondFromUsage(message.usage) !== undefined) {
-				gatewayUsages.push(message.usage);
-			}
 		}
 	});
 
@@ -162,9 +169,10 @@ export default function (pi: ExtensionAPI) {
 		setElapsedStatus(ctx, elapsedSecondsFloor);
 		statusCtx = ctx;
 
+		const tps = formatGatewayTokensPerSecond(capturedTokensPerSecond);
+		restoreFetch?.();
+		restoreFetch = undefined;
 		if (elapsedMs <= 0) return;
-
-		const tps = formatGatewayTokensPerSecond(gatewayUsages);
 		const message = `TPS ${tps} tok/s. out ${output.toLocaleString()}, in ${input.toLocaleString()}, cache r/w ${cacheRead.toLocaleString()}/${cacheWrite.toLocaleString()}, total ${totalTokens.toLocaleString()}, ${elapsedSecondsExact.toFixed(1)}s`;
 		ctx.ui.notify(message, "info");
 	});
@@ -176,5 +184,8 @@ export default function (pi: ExtensionAPI) {
 		pausedDurationAtStartMs = 0;
 		pauseWasEnabledAtStart = false;
 		statusCtx = null;
+		restoreFetch?.();
+		restoreFetch = undefined;
+		capturedTokensPerSecond = undefined;
 	});
 }

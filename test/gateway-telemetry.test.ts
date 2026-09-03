@@ -1,14 +1,46 @@
 import { describe, expect, it } from "vitest";
-import { formatGatewayTokensPerSecond, tokensPerSecondFromUsage } from "../extensions/gateway-telemetry.ts";
+import {
+	captureGatewayTokensPerSecond,
+	formatGatewayTokensPerSecond,
+	tokensPerSecondFromHeaders,
+	wrapFetchCaptureTokensPerSecond,
+} from "../extensions/gateway-telemetry.ts";
 
-describe("gateway tok/s", () => {
-	it("prefers usage.tokens_per_second", () => {
-		expect(tokensPerSecondFromUsage({ tokens_per_second: 80.5, output: 200 })).toBe(80.5);
-		expect(formatGatewayTokensPerSecond([{ output: 10 }, { tokens_per_second: 40 }])).toBe("40.0");
+describe("gateway tok/s from Response headers", () => {
+	it("reads X-CLIProxyAPI-Tokens-Per-Second off a real Response", async () => {
+		const inner: typeof fetch = async () =>
+			new Response("{}", {
+				headers: { "X-CLIProxyAPI-Tokens-Per-Second": "80.5", "X-OmniRoute-Latency-Ms": "2000" },
+			});
+		let captured: number | undefined;
+		const wrapped = wrapFetchCaptureTokensPerSecond(inner, (tps) => {
+			captured = tps;
+		});
+		const response = await wrapped("https://gateway.example/v1/chat/completions");
+		expect(captureGatewayTokensPerSecond(response)).toBe(80.5);
+		expect(captured).toBe(80.5);
+		expect(formatGatewayTokensPerSecond(captured)).toBe("80.5");
 	});
 
-	it("does not invent tok/s from output / elapsed", () => {
-		expect(tokensPerSecondFromUsage({ output: 200, latency_ms: 2000 })).toBeUndefined();
-		expect(formatGatewayTokensPerSecond([{ output: 200 }])).toBe("--");
+	it("does not invent tok/s from latency or output headers", async () => {
+		const inner: typeof fetch = async () =>
+			new Response("{}", {
+				headers: {
+					"X-OmniRoute-Latency-Ms": "2000",
+					"X-OmniRoute-Tokens-Out": "200",
+				},
+			});
+		let captured: number | undefined;
+		const wrapped = wrapFetchCaptureTokensPerSecond(inner, (tps) => {
+			captured = tps;
+		});
+		await wrapped("https://gateway.example/v1/chat/completions");
+		expect(captured).toBeUndefined();
+		expect(
+			tokensPerSecondFromHeaders(
+				new Headers({ "X-OmniRoute-Latency-Ms": "2000", "X-OmniRoute-Tokens-Out": "200" }),
+			),
+		).toBeUndefined();
+		expect(formatGatewayTokensPerSecond(undefined)).toBe("--");
 	});
 });
