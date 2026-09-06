@@ -99,65 +99,29 @@ function rewriteRelativeImports(source: string, originalDir: string): string {
 	});
 }
 
-function patchWebSocketOnlyTransport(source: string): string {
+function patchCodexTransportForCliproxy(source: string): string {
 	const sessionIdExpression = String.raw`(?:options\?\.sessionId|cacheSessionId)`;
 	const disabledForSession = new RegExp(
 		String.raw`const websocketDisabledForSession\s*=\s*transport !== "sse" && isWebSocketSseFallbackActive\(${sessionIdExpression}\);`,
 	);
-	const retryVariables = /let retriedWebSocketConnectionLimit\s*=\s*false;/;
-	const connectionLimitRetry =
-		/if \(!aborted && connectionLimitBeforeStart && !retriedWebSocketConnectionLimit\) \{\s*retriedWebSocketConnectionLimit = true;\s*continue;\s*\}/;
-	const websocketFailureHandling = new RegExp(
-		String.raw`if \(aborted \|\| \(isCodexNonTransportError\(error\) && !connectionLimitBeforeStart\)\) \{[\s\S]*?recordWebSocketFailure\((${sessionIdExpression}), error\);[\s\S]*?recordWebSocketSseFallback\(\1\);\s*break;`,
-	);
-	const fallbackSessionRecord = "websocketSseFallbackSessions.add(sessionId);";
-	const fallbackActiveRecord = "stats.websocketFallbackActive = true;";
+	const startedThrow = /if \(websocketStarted\) \{\s*throw error;\s*\}/;
 
-	for (const fragment of [fallbackSessionRecord, fallbackActiveRecord]) {
-		if (!source.includes(fragment)) {
-			throw new Error("openai-codex-responses source no longer supports the WebSocket-only transport patch");
-		}
-	}
-	for (const pattern of [disabledForSession, retryVariables, connectionLimitRetry, websocketFailureHandling]) {
-		if (!pattern.test(source)) {
-			throw new Error("openai-codex-responses source no longer supports the WebSocket-only transport patch");
-		}
+	if (!disabledForSession.test(source) || !startedThrow.test(source)) {
+		throw new Error("openai-codex-responses source no longer supports the CLIProxyAPI SSE fallback patch");
 	}
 
 	return source
-		.replace(disabledForSession, "const websocketDisabledForSession = false;")
 		.replace(
-			retryVariables,
-			`let websocketRetries = 0;
-                const maxWebSocketRetries = Number.isFinite(options?.maxRetries)
-                    ? Math.min(Math.max(0, Math.floor(options.maxRetries)), 5)
-                    : 3;`,
+			disabledForSession,
+			'const websocketDisabledForSession = transport !== "sse" && (isWebSocketSseFallbackActive(cacheSessionId) || !accountId);',
 		)
-		.replace(connectionLimitRetry, "")
 		.replace(
-			websocketFailureHandling,
-			(
-				_match,
-				activeSessionId: string,
-			) => `if (aborted || (isCodexNonTransportError(error) && !connectionLimitBeforeStart)) {
+			startedThrow,
+			`if (websocketStarted) {
+                            recordWebSocketSseFallback(cacheSessionId);
                             throw error;
-                        }
-                        if (!websocketStarted && websocketRetries < maxWebSocketRetries) {
-                            websocketRetries++;
-                            continue;
-                        }
-                        appendAssistantMessageDiagnostic(output, createAssistantMessageDiagnostic("provider_transport_failure", error, {
-                            configuredTransport: transport,
-                            fallbackTransport: undefined,
-                            eventsEmitted: websocketStarted,
-                            phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
-                            requestBytes: new TextEncoder().encode(bodyJson).byteLength,
-                        }));
-                        recordWebSocketFailure(${activeSessionId}, error);
-                        throw error;`,
-		)
-		.replace(fallbackSessionRecord, "")
-		.replace(fallbackActiveRecord, "stats.websocketFallbackActive = false;");
+                        }`,
+		);
 }
 
 export function patchCodexSource(source: string, providerIds: string[]): string {
@@ -193,9 +157,10 @@ export function patchCodexSource(source: string, providerIds: string[]): string 
 	// Keep assistant message api metadata aligned with the registered custom api id.
 	src = src.replaceAll(`api: "openai-codex-responses"`, `api: ${JSON.stringify(CLIPROXYAPI_CODEX_API)}`);
 
-	// CLIProxyAPI needs a persistent WebSocket transport. Reconnect before the
-	// response starts and surface a failure rather than silently switching to SSE.
-	src = patchWebSocketOnlyTransport(src);
+	// Plain CPA keys have no ChatGPT account id. Prefer SSE for those models, and
+	// record SSE fallback after a mid-stream WebSocket failure so the next attempt
+	// does not retry the same Azure 502 as a generic WebSocket error.
+	src = patchCodexTransportForCliproxy(src);
 
 	// The generated module lives outside the original source map directory.
 	src = src.replace(/^\/\/# sourceMappingURL=.*$/gm, "");

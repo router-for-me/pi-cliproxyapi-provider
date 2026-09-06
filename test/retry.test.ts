@@ -1,7 +1,11 @@
 import { type AssistantMessage, isRetryableAssistantError } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
-import { normalizeTransientNetworkError, registerTransientNetworkErrorRetry } from "../extensions/retry.ts";
+import {
+	normalizeCapacityError,
+	normalizeTransientNetworkError,
+	registerTransientNetworkErrorRetry,
+} from "../extensions/retry.ts";
 
 const TRANSIENT_STREAM_ERRORS = [
 	"Codex error: read tcp 172.16.209.2:57303->172.64.155.209:443: use of closed network connection",
@@ -48,6 +52,31 @@ describe("transient network error normalization", () => {
 		expect(normalizeTransientNetworkError(retryable)).toBe(retryable);
 		expect(normalizeTransientNetworkError(unrelated)).toBe(unrelated);
 	});
+});
+
+const CAPACITY_ERRORS = [
+	"The system is currently experiencing high demand and cannot process your request. Your request exceeds the maximum usage size allowed during peak load.",
+	"no healthy upstream",
+];
+
+describe("capacity error normalization", () => {
+	it.each(CAPACITY_ERRORS)("keeps Azure capacity failures non-retryable: %s", (errorMessage) => {
+		const original = assistantError(errorMessage);
+		expect(isRetryableAssistantError(original)).toBe(false);
+
+		const normalized = normalizeCapacityError(original);
+		expect(normalized).not.toBe(original);
+		expect(normalized.errorMessage).toBe(`capacity error: ${errorMessage}`);
+		expect(isRetryableAssistantError(normalized)).toBe(false);
+		expect(normalizeTransientNetworkError(normalized)).toBe(normalized);
+	});
+
+	it("does not rewrite generic WebSocket errors until CPA forwards the Azure body", () => {
+		const websocket = assistantError("WebSocket error");
+		expect(isRetryableAssistantError(websocket)).toBe(true);
+		expect(normalizeCapacityError(websocket)).toBe(websocket);
+		expect(normalizeTransientNetworkError(websocket)).toBe(websocket);
+	});
 
 	it("only rewrites assistant errors from the registered provider", () => {
 		let handler: ((event: any, ctx: ExtensionContext) => unknown) | undefined;
@@ -64,6 +93,13 @@ describe("transient network error normalization", () => {
 			message: AssistantMessage;
 		};
 		expect(replacement.message.errorMessage).toBe(`network error: ${TRANSIENT_STREAM_ERRORS[0]}`);
+
+		const capacity = assistantError(CAPACITY_ERRORS[0]);
+		const capacityReplacement = handler({ type: "message_end", message: capacity }, {} as ExtensionContext) as {
+			message: AssistantMessage;
+		};
+		expect(capacityReplacement.message.errorMessage).toBe(`capacity error: ${CAPACITY_ERRORS[0]}`);
+		expect(isRetryableAssistantError(capacityReplacement.message)).toBe(false);
 
 		const otherProvider = assistantError(TRANSIENT_STREAM_ERRORS[0], "other");
 		expect(handler({ type: "message_end", message: otherProvider }, {} as ExtensionContext)).toBeUndefined();
