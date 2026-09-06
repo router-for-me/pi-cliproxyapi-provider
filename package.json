@@ -1,6 +1,6 @@
 {
 	"name": "@router-for-me/pi-cliproxyapi-provider",
-	"version": "1.4.15",
+	"version": "1.4.16",
 	"description": "Pi provider extension that auto-registers CLIProxyAPI models, plus TUI elapsed/TPS status",
 	"type": "module",
 	"keywords": [
