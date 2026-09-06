@@ -14,9 +14,9 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
+import { createRequire, isBuiltin } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, normalize } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Api, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 
@@ -92,11 +92,120 @@ const EXTRACT_ACCOUNT_ID_PATCH = `function extractAccountId(token) {
     }
 }`;
 
-function rewriteRelativeImports(source: string, originalDir: string): string {
-	return source.replace(/from\s+"((?:\.\.?\/)[^"]+)"/g, (_full, relPath: string) => {
-		const absolute = pathToFileURL(join(originalDir, relPath)).href;
-		return `from ${JSON.stringify(absolute)}`;
-	});
+const IMPORT_FROM_SPECIFIER = /from\s+(["'])([^"']+)\1/g;
+
+function stripSourceMappingUrl(source: string): string {
+	return source.replace(/^\/\/# sourceMappingURL=.*$/gm, "");
+}
+const CODEX_MODULE_RELATIVE = join(
+	"node_modules",
+	"@earendil-works",
+	"pi-ai",
+	"dist",
+	"api",
+	"openai-codex-responses.js",
+);
+
+/**
+ * Well-known filesystem locations for openai-codex-responses.js on bundled hosts.
+ *
+ * @param homeDirectory - User home used as the root for `.omp` and `.pi` plugin trees
+ * @returns Candidate absolute paths in probe order
+ */
+export function wellKnownCodexModuleCandidates(homeDirectory: string): string[] {
+	return [
+		join(homeDirectory, ".omp", "plugins", CODEX_MODULE_RELATIVE),
+		join(
+			homeDirectory,
+			".omp",
+			"plugins",
+			"node_modules",
+			"@earendil-works",
+			"pi-coding-agent",
+			CODEX_MODULE_RELATIVE,
+		),
+		join(homeDirectory, ".pi", "agent", "npm", CODEX_MODULE_RELATIVE),
+		join(
+			homeDirectory,
+			".pi",
+			"agent",
+			"npm",
+			"node_modules",
+			"@earendil-works",
+			"pi-coding-agent",
+			CODEX_MODULE_RELATIVE,
+		),
+	];
+}
+
+/**
+ * Rewrite one module so relative and bare imports become absolute file URLs
+ * resolved from `originalPath`'s package graph.
+ *
+ * @param source - Module source containing `from "..."` specifiers
+ * @param originalPath - Physical file used as the resolve base
+ * @returns Source with resolvable file URL imports
+ */
+export function rewritePatchedModuleImports(source: string, originalPath: string): string {
+	const requireFromOriginal = createRequire(pathToFileURL(originalPath));
+	const originalDir = dirname(originalPath);
+	return stripSourceMappingUrl(
+		source.replace(IMPORT_FROM_SPECIFIER, (full, _quote: string, specifier: string) => {
+			if (specifier.startsWith("node:") || isBuiltin(specifier)) {
+				return full;
+			}
+			if (specifier.startsWith(".")) {
+				return `from ${JSON.stringify(pathToFileURL(join(originalDir, specifier)).href)}`;
+			}
+			const resolved = requireFromOriginal.resolve(specifier);
+			return `from ${JSON.stringify(pathToFileURL(resolved).href)}`;
+		}),
+	);
+}
+
+/**
+ * Write a patched module (and rewritten local relatives) so a cache file
+ * outside the original tree can still resolve bare deps such as `partial-json`.
+ *
+ * @param outputPath - Destination `.mjs` path, typically under tmpdir
+ * @param source - Patched entry source
+ * @param originalPath - Physical openai-codex-responses.js used for resolution
+ */
+export function writePatchedModuleCache(outputPath: string, source: string, originalPath: string): void {
+	mkdirSync(dirname(outputPath), { recursive: true });
+	const cacheDir = dirname(outputPath);
+	const rewrittenLocals = new Map<string, string>();
+
+	const rewrite = (moduleSource: string, moduleOriginalPath: string): string => {
+		const requireFromOriginal = createRequire(pathToFileURL(moduleOriginalPath));
+		const originalDir = dirname(moduleOriginalPath);
+		return stripSourceMappingUrl(
+			moduleSource.replace(IMPORT_FROM_SPECIFIER, (full, _quote: string, specifier: string) => {
+				if (specifier.startsWith("node:") || isBuiltin(specifier)) {
+					return full;
+				}
+				if (specifier.startsWith(".")) {
+					const targetOriginal = normalize(join(originalDir, specifier));
+					let targetUrl = rewrittenLocals.get(targetOriginal);
+					if (!targetUrl) {
+						if (!existsSync(targetOriginal)) {
+							return `from ${JSON.stringify(pathToFileURL(targetOriginal).href)}`;
+						}
+						const localName = `local-${createHash("sha1").update(targetOriginal).digest("hex").slice(0, 12)}.mjs`;
+						const localPath = join(cacheDir, localName);
+						targetUrl = pathToFileURL(localPath).href;
+						rewrittenLocals.set(targetOriginal, targetUrl);
+						writeFileSync(localPath, rewrite(readFileSync(targetOriginal, "utf8"), targetOriginal), "utf8");
+					}
+					return `from ${JSON.stringify(targetUrl)}`;
+				}
+				const resolved = requireFromOriginal.resolve(specifier);
+				return `from ${JSON.stringify(pathToFileURL(resolved).href)}`;
+			}),
+		);
+	};
+
+	writeFileSync(outputPath, rewrite(source, originalPath), "utf8");
 }
 
 function patchWebSocketOnlyTransport(source: string): string {
@@ -218,21 +327,46 @@ export function resolveCodexModuleFromNodeEntry(entryPath: string): string | und
 	return undefined;
 }
 
-function resolveOriginalCodexModulePath(): { path: string; dir: string } {
+export interface ResolveOriginalCodexModulePathOptions {
+	/** Override `import.meta.resolve`. Throw to simulate a bundled host with no package graph. */
+	resolveSpecifier?: (specifier: string) => string;
+	/** Override `process.argv[1]`. Pass a non-Node host path to skip createRequire success. */
+	nodeEntry?: string | undefined;
+	/** Override `HOME` / `USERPROFILE` for well-known filesystem fallbacks. */
+	homeDirectory?: string | undefined;
+}
+
+/**
+ * Locate the physical openai-codex-responses.js used as the patch source.
+ *
+ * Probe order: import.meta.resolve, argv/createRequire, then HOME/well-known paths.
+ *
+ * @param options - Optional resolve/argv/home overrides for tests and bundled hosts
+ * @returns Existing module path and its directory
+ * @throws If no candidate exists on disk
+ */
+export function resolveOriginalCodexModulePath(options: ResolveOriginalCodexModulePathOptions = {}): {
+	path: string;
+	dir: string;
+} {
 	// Under pi's extension loader, `@earendil-works/pi-ai` may resolve to dist/compat.js
 	// and package subpath resolve for `/api/*` can fail. Prefer locating the physical
 	// dist file next to the resolved package entry.
+	const resolveSpecifier = options.resolveSpecifier ?? ((specifier: string) => import.meta.resolve(specifier));
+	const nodeEntry = "nodeEntry" in options ? options.nodeEntry : process.argv[1];
+	const homeDirectory =
+		"homeDirectory" in options ? options.homeDirectory : process.env.HOME || process.env.USERPROFILE;
 	const candidates: string[] = [];
 
 	try {
-		const subpath = import.meta.resolve("@earendil-works/pi-ai/api/openai-codex-responses");
+		const subpath = resolveSpecifier("@earendil-works/pi-ai/api/openai-codex-responses");
 		candidates.push(fileURLToPath(subpath));
 	} catch {
 		// ignore and try filesystem candidates
 	}
 
 	try {
-		const main = fileURLToPath(import.meta.resolve("@earendil-works/pi-ai"));
+		const main = fileURLToPath(resolveSpecifier("@earendil-works/pi-ai"));
 		const distDir = dirname(main);
 		candidates.push(join(distDir, "api/openai-codex-responses.js"));
 		candidates.push(join(distDir, "openai-codex-responses.js"));
@@ -243,11 +377,16 @@ function resolveOriginalCodexModulePath(): { path: string; dir: string } {
 	// pi 0.84.3's bundled Node CLI exposes pi-ai as a virtual module to
 	// extensions. Resolve its physical nested dependency from the CLI entry so
 	// the source-patching transport can still read the installed implementation.
-	if (process.argv[1]) {
-		const bundledHostModule = resolveCodexModuleFromNodeEntry(process.argv[1]);
+	// Oh My Pi Mach-O hosts do not have a Node entry at argv[1]; skip quietly.
+	if (nodeEntry) {
+		const bundledHostModule = resolveCodexModuleFromNodeEntry(nodeEntry);
 		if (bundledHostModule) {
 			candidates.push(bundledHostModule);
 		}
+	}
+
+	if (homeDirectory) {
+		candidates.push(...wellKnownCodexModuleCandidates(homeDirectory));
 	}
 
 	for (const path of candidates) {
@@ -263,16 +402,16 @@ export async function loadCliproxyCodexStreams(
 	providerIds: string[] = ["cliproxyapi"],
 	options: CliproxyCodexStreamOptions = {},
 ): Promise<CliproxyCodexStreams> {
-	const { path: originalPath, dir: originalDir } = resolveOriginalCodexModulePath();
+	const { path: originalPath } = resolveOriginalCodexModulePath();
 	const originalSource = readFileSync(originalPath, "utf8");
-	const patched = rewriteRelativeImports(patchCodexSource(originalSource, providerIds), originalDir);
+	const patched = patchCodexSource(originalSource, providerIds);
 
-	const hash = createHash("sha1").update(patched).digest("hex").slice(0, 16);
+	const hash = createHash("sha1").update("resolved-imports-v1\n").update(patched).digest("hex").slice(0, 16);
 	const cacheDir = join(tmpdir(), "pi-cliproxyapi-provider");
 	mkdirSync(cacheDir, { recursive: true });
 	const outPath = join(cacheDir, `openai-codex-responses-cpa-${hash}.mjs`);
 	if (!existsSync(outPath)) {
-		writeFileSync(outPath, patched, "utf8");
+		writePatchedModuleCache(outPath, patched, originalPath);
 	}
 
 	const mod = (await import(pathToFileURL(outPath).href)) as {
