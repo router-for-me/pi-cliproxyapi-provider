@@ -31,6 +31,7 @@ export type CliproxyCodexStreamSimple = (
 export type CliproxyCodexStreams = {
 	streamSimple: CliproxyCodexStreamSimple;
 	stream: CliproxyCodexStreamSimple;
+	closeSessions: (sessionId?: string) => void;
 	api: typeof CLIPROXYAPI_CODEX_API;
 };
 
@@ -278,10 +279,17 @@ export async function loadCliproxyCodexStreams(
 	const mod = (await import(pathToFileURL(outPath).href)) as {
 		streamSimple: CliproxyCodexStreamSimple;
 		stream: CliproxyCodexStreamSimple;
+		closeOpenAICodexWebSocketSessions: (sessionId?: string) => void;
 	};
 
-	if (typeof mod.streamSimple !== "function" || typeof mod.stream !== "function") {
-		throw new Error("patched openai-codex-responses module missing streamSimple/stream exports");
+	if (
+		typeof mod.streamSimple !== "function" ||
+		typeof mod.stream !== "function" ||
+		typeof mod.closeOpenAICodexWebSocketSessions !== "function"
+	) {
+		throw new Error(
+			"patched openai-codex-responses module missing streamSimple/stream/closeOpenAICodexWebSocketSessions exports",
+		);
 	}
 
 	const streamSimple = wrapStreamSimpleForFast(mod.streamSimple, options.shouldUseFast);
@@ -290,5 +298,6 @@ export async function loadCliproxyCodexStreams(
 		api: CLIPROXYAPI_CODEX_API,
 		streamSimple,
 		stream: mod.stream,
+		closeSessions: mod.closeOpenAICodexWebSocketSessions,
 	};
 }
