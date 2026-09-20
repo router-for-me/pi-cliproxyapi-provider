@@ -11,6 +11,7 @@ const CLIPROXYAPI_ENV_NAMES = [
 	"CLIPROXYAPI_API_KEY",
 	"CLIPROXYAPI_BASE_URL",
 	"CLIPROXYAPI_FAST",
+	"CLIPROXYAPI_PROTOCOL",
 	"CLIPROXYAPI_PROVIDER_ID",
 	"CLIPROXYAPI_PROVIDER_NAME",
 ] as const;
@@ -77,6 +78,71 @@ function createPiMock(commands: Map<string, Parameters<ExtensionAPI["registerCom
 }
 
 describe("pi 0.82.0 compatibility", () => {
+	it("warns once when /v1 automatically selects openai-responses", async () => {
+		await withTempAgentDir(async (agentDir) => {
+			writeFileSync(
+				join(agentDir, "cliproxyapi.json"),
+				JSON.stringify({ baseUrl: "http://relay.api/v1", apiKey: "stored-key" }),
+				"utf8",
+			);
+
+			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const { pi } = createPiMock(commands);
+			const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+				new Response(JSON.stringify({ models: [] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+			const warnMock = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+			try {
+				await providerExtension(pi);
+				const migrationWarnings = warnMock.mock.calls.filter(([message]) =>
+					String(message).includes("Earlier versions treated /v1 as openai-codex"),
+				);
+				expect(migrationWarnings).toHaveLength(1);
+				expect(String(migrationWarnings[0]?.[0])).toMatch(/protocol.*openai-codex/);
+			} finally {
+				warnMock.mockRestore();
+				fetchMock.mockRestore();
+			}
+		});
+	});
+
+	it("does not warn about /v1 migration when the environment selects a protocol", async () => {
+		await withTempAgentDir(async (agentDir) => {
+			writeFileSync(
+				join(agentDir, "cliproxyapi.json"),
+				JSON.stringify({ baseUrl: "http://relay.api/v1", apiKey: "stored-key" }),
+				"utf8",
+			);
+			process.env.CLIPROXYAPI_PROTOCOL = "openai-codex";
+
+			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const { pi } = createPiMock(commands);
+			const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+				new Response(JSON.stringify({ models: [] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+			const warnMock = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+			try {
+				await providerExtension(pi);
+				expect(
+					warnMock.mock.calls.some(([message]) =>
+						String(message).includes("Earlier versions treated /v1 as openai-codex"),
+					),
+				).toBe(false);
+			} finally {
+				warnMock.mockRestore();
+				fetchMock.mockRestore();
+			}
+		});
+	});
+
 	it("registers oauth login and /fast without a dedicated /cliproxyapi command", async () => {
 		await withTempAgentDir(async () => {
 			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
@@ -207,12 +273,17 @@ describe("pi 0.82.0 compatibility", () => {
 			);
 			writeFileSync(
 				join(agentDir, "cliproxyapi.json"),
-				JSON.stringify({ baseUrl: "http://127.0.0.1:8317", apiKey: "stored-key" }),
+				JSON.stringify({
+					baseUrl: "http://127.0.0.1:8317/v1",
+					apiKey: "stored-key",
+					protocol: "openai-responses",
+				}),
 				"utf8",
 			);
 
 			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
 			const { pi } = createPiMock(commands);
+			const warnMock = vi.spyOn(console, "warn").mockImplementation(() => {});
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
 				new Response(JSON.stringify({ models: [] }), {
 					status: 200,
@@ -222,6 +293,11 @@ describe("pi 0.82.0 compatibility", () => {
 
 			try {
 				await expect(providerExtension(pi)).resolves.toBeUndefined();
+				expect(
+					warnMock.mock.calls.some(([message]) =>
+						String(message).includes("Earlier versions treated /v1 as openai-codex"),
+					),
+				).toBe(false);
 				expect(fetchMock).toHaveBeenCalled();
 				expect(commands.size).toBe(4);
 				expect(commands.has("fast")).toBe(true);
@@ -233,9 +309,13 @@ describe("pi 0.82.0 compatibility", () => {
 					"cliproxyapi",
 					expect.objectContaining({
 						oauth: expect.any(Object),
+						headers: {
+							"X-Codex-Beta-Features": "remote_compaction_v2",
+						},
 					}),
 				);
 			} finally {
+				warnMock.mockRestore();
 				fetchMock.mockRestore();
 			}
 		});

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	AUTH_FILE_NAME,
+	autoDetectProtocol,
 	buildInputModalities,
 	buildThinkingLevelMap,
 	CONFIG_FILE_NAME,
@@ -76,8 +77,8 @@ describe("resolveEndpoints", () => {
 		expect(result.modelsUrl).toBe("http://127.0.0.1:8317/v1/models?client_version=pi");
 	});
 
-	it("rewrites /v1 to /backend-api for inference", () => {
-		const result = resolveEndpoints("http://127.0.0.1:8317/v1");
+	it("rewrites /v1 to /backend-api for inference in openai-codex mode", () => {
+		const result = resolveEndpoints("http://127.0.0.1:8317/v1", "openai-codex");
 		expect(result.inferenceBaseUrl).toBe("http://127.0.0.1:8317/backend-api/");
 		expect(result.modelsUrl).toBe("http://127.0.0.1:8317/v1/models?client_version=pi");
 	});
@@ -90,6 +91,54 @@ describe("resolveEndpoints", () => {
 
 	it("throws on empty baseUrl", () => {
 		expect(() => resolveEndpoints("   ")).toThrow(/baseUrl is empty/);
+	});
+});
+
+describe("autoDetectProtocol", () => {
+	it("detects openai-responses from /v1 path", () => {
+		expect(autoDetectProtocol("http://relay.api/v1")).toBe("openai-responses");
+		expect(autoDetectProtocol("http://relay.api/v1/")).toBe("openai-responses");
+		expect(autoDetectProtocol("http://relay.api:8080/prefix/v1")).toBe("openai-responses");
+	});
+
+	it("defaults to openai-codex for root or /backend-api paths", () => {
+		expect(autoDetectProtocol("http://relay.api")).toBe("openai-codex");
+		expect(autoDetectProtocol("http://relay.api/backend-api")).toBe("openai-codex");
+		expect(autoDetectProtocol("127.0.0.1:8317")).toBe("openai-codex");
+	});
+
+	it("returns openai-codex for empty or malformed input", () => {
+		expect(autoDetectProtocol("")).toBe("openai-codex");
+	});
+});
+
+describe("resolveEndpoints openai-responses mode", () => {
+	it("preserves /v1 as inference base for relay APIs", () => {
+		const result = resolveEndpoints("http://relay.api/v1", "openai-responses");
+		expect(result.inferenceBaseUrl).toBe("http://relay.api/v1/");
+		expect(result.modelsUrl).toBe("http://relay.api/v1/models?client_version=pi");
+		expect(result.rootOrigin).toBe("http://relay.api");
+	});
+
+	it("adds /v1 when only host given in openai-responses mode", () => {
+		const result = resolveEndpoints("http://relay.api", "openai-responses");
+		expect(result.inferenceBaseUrl).toBe("http://relay.api/v1/");
+		expect(result.modelsUrl).toBe("http://relay.api/v1/models?client_version=pi");
+	});
+
+	it("rewrites /backend-api to /v1 for relay APIs", () => {
+		const result = resolveEndpoints("http://relay.api/backend-api", "openai-responses");
+		expect(result.inferenceBaseUrl).toBe("http://relay.api/v1/");
+		expect(result.modelsUrl).toBe("http://relay.api/v1/models?client_version=pi");
+	});
+
+	it("auto-detects openai-responses using autoDetectProtocol and resolveEndpoints together", () => {
+		// Callers combine autoDetectProtocol() + resolveEndpoints() to get the correct URL
+		const url = "http://relay.api/v1";
+		const proto = autoDetectProtocol(url);
+		expect(proto).toBe("openai-responses");
+		const result = resolveEndpoints(url, proto);
+		expect(result.inferenceBaseUrl).toBe("http://relay.api/v1/");
 	});
 });
 

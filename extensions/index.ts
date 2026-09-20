@@ -21,10 +21,17 @@
 import type { Api, Model, OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { ProactiveCompactionController } from "./auto-compact.ts";
-import { CLIPROXYAPI_CODEX_API, type CliproxyCodexStreamSimple, loadCliproxyCodexStreams } from "./codex-stream.ts";
+import {
+	CLIPROXYAPI_CODEX_API,
+	type CliproxyCodexStreamSimple,
+	createProtocolStreamDispatcher,
+	loadCliproxyCodexStreams,
+	loadCliproxyResponsesStreams,
+} from "./codex-stream.ts";
 import { FastModeController } from "./fast.ts";
 import { FastFooterController } from "./fast-footer.ts";
 import {
+	autoDetectProtocol,
 	CONFIG_FILE_NAME,
 	CREDENTIAL_TTL_MS,
 	DEFAULT_BASE_URL,
@@ -41,6 +48,7 @@ import {
 	resolveIdentity,
 	resolveMappedModels,
 	resolvePauseDefault,
+	resolveProtocol,
 	saveConfigFile,
 } from "./lib.ts";
 import type { PauseController } from "./pause.ts";
@@ -121,6 +129,20 @@ function resolveDefaultBaseUrl(agentDir: string, providerId: string): string {
 	}
 
 	return firstNonEmpty(process.env.CLIPROXYAPI_BASE_URL, fileBaseUrl, authBaseUrl, DEFAULT_BASE_URL)!;
+}
+
+function shouldWarnAboutV1ProtocolMigration(agentDir: string, baseUrlInput: string): boolean {
+	const envProtocol = process.env.CLIPROXYAPI_PROTOCOL?.trim().toLowerCase();
+	if (envProtocol === "openai-codex" || envProtocol === "openai-responses") return false;
+
+	try {
+		const configProtocol = loadConfigFile(agentDir).protocol;
+		if (configProtocol === "openai-codex" || configProtocol === "openai-responses") return false;
+	} catch {
+		// Invalid or unavailable config provides no explicit protocol selection.
+	}
+
+	return autoDetectProtocol(baseUrlInput) === "openai-responses";
 }
 
 async function promptConnection(
@@ -308,7 +330,8 @@ function createOAuthHandlers(options: {
 				return models;
 			}
 			try {
-				const { inferenceBaseUrl } = resolveEndpoints(meta.baseUrl);
+				const protocol = resolveProtocol(agentDir, meta.baseUrl);
+				const { inferenceBaseUrl } = resolveEndpoints(meta.baseUrl, protocol);
 				return models.map((model) =>
 					model.provider === providerId ? { ...model, baseUrl: inferenceBaseUrl } : model,
 				);
@@ -349,7 +372,8 @@ function registerProvider(
 	} = options;
 	const refreshCoordinator = options.refreshCoordinator ?? new ModelRefreshCoordinator();
 
-	const endpoints = resolveEndpoints(baseUrlInput);
+	const protocol = resolveProtocol(agentDir, baseUrlInput);
+	const endpoints = resolveEndpoints(baseUrlInput, protocol);
 	const oauth = createOAuthHandlers({
 		pi,
 		agentDir,
@@ -371,6 +395,7 @@ function registerProvider(
 		baseUrl: endpoints.inferenceBaseUrl,
 		api: CLIPROXYAPI_CODEX_API,
 		streamSimple,
+		...(protocol === "openai-responses" ? { headers: { "X-Codex-Beta-Features": "remote_compaction_v2" } } : {}),
 		// OAuth-only keeps `/login <provider>` on the multi-field account path.
 		// Pass apiKey only for ambient request auth when no /login credential exists
 		// (config file / env). Never pass both for /login flows.
@@ -596,6 +621,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const agentDir = getAgentDir();
 	const identity = resolveIdentity(agentDir);
 	const defaultBaseUrl = resolveDefaultBaseUrl(agentDir, identity.providerId);
+	if (shouldWarnAboutV1ProtocolMigration(agentDir, defaultBaseUrl)) {
+		logWarn(
+			'Earlier versions treated /v1 as openai-codex. This URL now auto-selects openai-responses; set protocol: "openai-codex" in cliproxyapi.json or CLIPROXYAPI_PROTOCOL=openai-codex to preserve the previous behavior.',
+		);
+	}
 
 	let pauseEnabled = false;
 	try {
@@ -621,17 +651,35 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const fastMode = new FastModeController(fastEnabled);
 	const modelRefreshCoordinator = new ModelRefreshCoordinator();
 
-	let streamSimple: CliproxyCodexStreamSimple;
+	let codexStreamSimple: CliproxyCodexStreamSimple | undefined;
+	let responsesStreamSimple: CliproxyCodexStreamSimple | undefined;
+	let responsesStreamLoadError: unknown;
 	try {
-		const streams = await loadCliproxyCodexStreams([identity.providerId, "cliproxyapi"], {
+		const codexStreams = await loadCliproxyCodexStreams([identity.providerId, "cliproxyapi"], {
 			shouldUseFast: (model) => model.provider === identity.providerId && fastMode.isEffectiveFor(model.id),
 		});
-		streamSimple = proactiveCompaction.wrapStreamSimple(streams.streamSimple);
+		codexStreamSimple = proactiveCompaction.wrapStreamSimple(codexStreams.streamSimple);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		logWarn(`failed to load patched codex protocol: ${message}`);
 		return;
 	}
+
+	try {
+		const responsesStreams = await loadCliproxyResponsesStreams([identity.providerId, "cliproxyapi"], {
+			shouldUseFast: (model) => model.provider === identity.providerId && fastMode.isEffectiveFor(model.id),
+		});
+		responsesStreamSimple = proactiveCompaction.wrapStreamSimple(responsesStreams.streamSimple);
+	} catch (error) {
+		responsesStreamLoadError = error;
+		logWarn(`openai-responses protocol unavailable: ${error instanceof Error ? error.message : String(error)}`);
+	}
+
+	const streamSimple = createProtocolStreamDispatcher(
+		codexStreamSimple,
+		responsesStreamSimple,
+		responsesStreamLoadError,
+	);
 
 	const fastFooter = new FastFooterController(identity.providerId, fastMode, () =>
 		proactiveCompaction.getCompactionSettings(),
