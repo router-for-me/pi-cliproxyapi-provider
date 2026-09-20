@@ -241,3 +241,7 @@ Disable just this helper via `pi config` if you only want the CLIProxyAPI provid
   - non-200 / network / invalid baseUrl → nothing is persisted; re-enter baseUrl + API key
 - If CPA returns HTTP 200 with zero usable models: login still succeeds; re-run `/login CLIProxyAPI` later after models become available.
 - If the selected model does not provide a non-empty `service_tiers` array: the request is left unchanged; `/fast` still updates the global preference and warns when enabling it.
+
+## Codex transport
+
+The Codex path retries WebSocket a few times, then falls back to SSE if the upgrade fails (for example `Expected 101 status code` on `/v1/codex/responses`). A gateway that does not speak WebSocket is not treated as down.
