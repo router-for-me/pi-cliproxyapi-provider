@@ -16,6 +16,11 @@ Pi provider extension that discovers models from [CLIProxyAPI](https://github.co
 
 ## Install
 
+Model output limits use the first positive safe integer in `max_tokens`,
+`max_output_tokens`, or `max_completion_tokens`, independently of the context
+window. Missing or invalid limits retain the 16,384-token compatibility default;
+that default is not a claim about the upstream model.
+
 ```bash
 # from npm
 pi install npm:@router-for-me/pi-cliproxyapi-provider

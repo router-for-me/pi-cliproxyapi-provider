@@ -180,6 +180,49 @@ describe("model mapping helpers", () => {
 		expect(toPiModel({ display_name: "no-id" })).toBeNull();
 	});
 
+	it("preserves the CPA output limit independently of context size", () => {
+		const entry = { slug: "opencode-go/glm-lab", context_window: 98304, max_tokens: 12345 };
+		expect(toPiModel(entry)?.maxTokens).toBe(12345);
+		expect(toPiModel(entry)?.contextWindow).toBe(98304);
+	});
+
+	it.each([
+		undefined,
+		null,
+		0,
+		-1,
+		1.5,
+		Number.MAX_SAFE_INTEGER + 1,
+		Number.NaN,
+		Number.POSITIVE_INFINITY,
+		"12345",
+	])("uses the compatibility output limit for invalid catalog value %s", (value) => {
+		const entry = { slug: "unknown", max_tokens: value } as unknown as CodexClientModel;
+		expect(toPiModel(entry)?.maxTokens).toBe(DEFAULT_MAX_TOKENS);
+	});
+
+	it.each([
+		"max_tokens",
+		"max_output_tokens",
+		"max_completion_tokens",
+	] as const)("rejects fractional and unsafe %s values", (field) => {
+		for (const value of [1.5, Number.MAX_SAFE_INTEGER + 1]) {
+			expect(toPiModel({ slug: "unknown", [field]: value })?.maxTokens).toBe(DEFAULT_MAX_TOKENS);
+		}
+	});
+
+	it("skips invalid preferred output limits while retaining valid aliases", () => {
+		expect(toPiModel({ slug: "unknown", max_tokens: 1.5, max_output_tokens: 32000 })?.maxTokens).toBe(32000);
+		expect(
+			toPiModel({
+				slug: "unknown",
+				max_tokens: Number.MAX_SAFE_INTEGER + 1,
+				max_output_tokens: 1.5,
+				max_completion_tokens: 64000,
+			})?.maxTokens,
+		).toBe(64000);
+	});
+
 	it("falls back to default context window", () => {
 		const model = toPiModel({ id: "m1" });
 		expect(model?.contextWindow).toBe(DEFAULT_CONTEXT_WINDOW);
