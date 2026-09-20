@@ -52,26 +52,25 @@ describe("Codex protocol module resolution", () => {
 	});
 });
 
-describe("Codex WebSocket transport patch", () => {
-	it("reconnects WebSocket instead of falling back to SSE", () => {
+describe("Codex transport compatibility patch", () => {
+	it("preserves pi's WebSocket-to-SSE fallback", () => {
 		const source = readFileSync(
 			new URL("../node_modules/@earendil-works/pi-ai/dist/api/openai-codex-responses.js", import.meta.url),
 			"utf8",
 		);
 		const patched = patchCodexSource(source, ["cliproxyapi"]);
 
-		expect(patched).toContain("const websocketDisabledForSession = false;");
-		expect(patched).toContain("let websocketRetries = 0;");
+		expect(patched).toContain(
+			'const websocketDisabledForSession = transport !== "sse" && isWebSocketSseFallbackActive(cacheSessionId);',
+		);
 		expect(patched).toContain("const connectionLimitBeforeStart = !websocketStarted");
 		expect(patched).toContain("isCodexNonTransportError(error) && !connectionLimitBeforeStart");
 		expect(patched).toContain("const previousResponseNotFound = isPreviousResponseNotFoundError(error);");
 		expect(patched).toContain("recordWebSocketFailure(cacheSessionId, error);");
-		expect(patched).toContain("const maxWebSocketRetries = Number.isFinite(options?.maxRetries)");
-		expect(patched).toContain("? Math.min(Math.max(0, Math.floor(options.maxRetries)), 5)");
-		expect(patched).toContain(": 3;");
-		expect(patched).not.toContain('fallbackTransport: websocketStarted ? undefined : "sse",');
-		expect(patched).not.toContain("websocketSseFallbackSessions.add(sessionId);");
-		expect(patched).not.toMatch(/recordWebSocketSseFallback\([^)]*\);\s*break;/);
+		expect(patched).toContain('fallbackTransport: websocketStarted ? undefined : "sse",');
+		expect(patched).toContain("websocketSseFallbackSessions.add(sessionId);");
+		expect(patched).toMatch(/recordWebSocketSseFallback\([^)]*\);\s*break;/);
+		expect(patched).not.toContain("let websocketRetries = 0;");
 	});
 });
 
