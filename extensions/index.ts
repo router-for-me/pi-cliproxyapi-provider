@@ -179,6 +179,12 @@ class ModelRefreshCoordinator {
 		this.activeController = undefined;
 		this.generation += 1;
 	}
+
+	cancel(): void {
+		this.activeController?.abort();
+		this.activeController = undefined;
+		this.generation += 1;
+	}
 }
 
 function logWarn(message: string): void {
@@ -792,6 +798,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	}
 	const fastMode = new FastModeController(fastEnabled);
 	const modelRefreshCoordinator = new ModelRefreshCoordinator();
+	pi.on("session_shutdown", () => modelRefreshCoordinator.cancel());
 
 	let streamSimple: CliproxyCodexStreamSimple;
 	try {
