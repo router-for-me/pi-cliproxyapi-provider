@@ -86,6 +86,44 @@ describe("pi 0.82.0 compatibility", () => {
 		unregisterApiProviders(COMPAT_SOURCE_ID);
 	});
 
+	it("re-registers in place on hosts without unregisterProvider", async () => {
+		await withTempAgentDir(async (agentDir) => {
+			writeFileSync(
+				join(agentDir, "cliproxyapi.json"),
+				JSON.stringify({ baseUrl: "http://127.0.0.1:8317", apiKey: "ambient-key" }),
+				"utf8",
+			);
+
+			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const { pi } = createPiMock(commands);
+			Reflect.deleteProperty(pi as object, "unregisterProvider");
+			const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+				new Response(JSON.stringify({ models: [] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+
+			try {
+				await expect(providerExtension(pi)).resolves.toBeUndefined();
+				const registerCallsAfterLoad = (pi.registerProvider as ReturnType<typeof vi.fn>).mock.calls.length;
+				expect(registerCallsAfterLoad).toBeGreaterThan(0);
+				expect("unregisterProvider" in pi).toBe(false);
+
+				const refresh = commands.get("cliproxyapi-refresh");
+				if (!refresh) throw new Error("cliproxyapi-refresh command is unavailable");
+				await refresh.handler("", { ui: { notify: vi.fn() } } as unknown as ExtensionCommandContext);
+
+				// Without unregisterProvider the host cannot replace; refresh only
+				// re-registers. Stale merged fields are a documented host limitation.
+				expect(pi.registerProvider).toHaveBeenCalledTimes(registerCallsAfterLoad + 1);
+				expect("unregisterProvider" in pi).toBe(false);
+			} finally {
+				fetchMock.mockRestore();
+			}
+		});
+	});
+
 	it("registers oauth login and /fast without a dedicated /cliproxyapi command", async () => {
 		await withTempAgentDir(async () => {
 			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
@@ -574,4 +612,21 @@ describe("pi 0.82.0 compatibility", () => {
 			}
 		});
 	});
+
+	it("normalizes OMP system prompt arrays before invoking the Pi Codex stream", async () => {
+		const { wrapStreamSimpleForFast } = await import("../extensions/codex-stream.ts");
+		const eventStream = {} as import("@earendil-works/pi-ai").AssistantMessageEventStream;
+		const delegate = vi.fn(() => eventStream) as unknown as import("../extensions/codex-stream.ts").CliproxyCodexStreamSimple;
+		const wrapped = wrapStreamSimpleForFast(delegate);
+		const model = { id: "gpt-5.6-sol", provider: "cliproxyapi" } as import("@earendil-works/pi-ai").Model<import("@earendil-works/pi-ai").Api>;
+		const context = {
+			systemPrompt: ["first", "second"],
+			messages: [],
+		} as unknown as import("@earendil-works/pi-ai").Context;
+		wrapped(model, context, { signal: undefined as never });
+		expect(delegate).toHaveBeenCalled();
+		const passed = delegate.mock.calls[0][1] as { systemPrompt?: unknown };
+		expect(typeof passed.systemPrompt === "string" || Array.isArray(passed.systemPrompt)).toBe(true);
+	});
+
 });
