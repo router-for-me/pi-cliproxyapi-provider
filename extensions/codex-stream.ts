@@ -432,6 +432,23 @@ export function patchCodexSource(source: string, providerIds: string[]): string 
 	// Keep assistant message api metadata aligned with the registered custom api id.
 	src = src.replaceAll(`api: "openai-codex-responses"`, `api: ${JSON.stringify(CLIPROXYAPI_CODEX_API)}`);
 
+	// The Claude Responses translator defaults to 32k when max_output_tokens is absent.
+	// Pi's streamSimple computes a context-clamped per-request maxTokens, including
+	// smaller limits for compaction summaries, but Codex does not serialize it.
+	const buildRequestBody = /function buildRequestBody\([\s\S]*?\n {4}return body;\n\}/;
+	if (!buildRequestBody.test(src)) {
+		throw new Error("openai-codex-responses source no longer exposes the request body builder");
+	}
+	src = src.replace(buildRequestBody, (builder) =>
+		builder.replace(
+			"    return body;",
+			`    if (model.id.startsWith("claude-") && Number.isFinite(options?.maxTokens) && options.maxTokens > 0 && body.max_output_tokens === undefined) {
+        body.max_output_tokens = Math.min(options.maxTokens, model.maxTokens);
+    }
+    return body;`,
+		),
+	);
+
 	// CLIProxyAPI prefers a persistent WebSocket transport. Reconnect before the
 	// response starts, and gracefully fall back to SSE if retries are exhausted.
 	src = patchWebSocketTransport(src);

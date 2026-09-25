@@ -981,7 +981,7 @@ describe("provider startup cache behavior", () => {
 			const origRegisterProvider = pi.registerProvider.bind(pi);
 			pi.registerProvider = ((...args: any[]) => {
 				if (piIsStale) throw new Error(staleErrorMsg);
-				return origRegisterProvider(...args);
+				return origRegisterProvider(...(args as Parameters<typeof origRegisterProvider>));
 			}) as any;
 
 			try {
