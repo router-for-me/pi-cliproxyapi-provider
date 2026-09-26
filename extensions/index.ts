@@ -126,7 +126,8 @@ class ModelRefreshCoordinator {
 					this.clearRecovery();
 					return;
 				}
-				logWarn(`auto-recovery refresh failed (${message}); will retry`);
+				// Suppressed: logging this into the TUI corrupts the display.
+				// The refresh path already reschedules the next attempt.
 			});
 		}, delay);
 		this.recoveryTimer.unref?.();
@@ -153,7 +154,8 @@ class ModelRefreshCoordinator {
 					this.clearRecovery();
 					return;
 				}
-				logWarn(`auto-recovery refresh failed (${message}); will retry`);
+				// Suppressed: logging this into the TUI corrupts the display.
+				// The refresh path already reschedules the next attempt.
 			});
 		}, snapshot.delayMs);
 		this.recoveryTimer.unref?.();
