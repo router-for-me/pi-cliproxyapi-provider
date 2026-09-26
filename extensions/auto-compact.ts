@@ -172,7 +172,8 @@ export class ProactiveCompactionController {
 			this.cachedCompactionSettings = undefined;
 			try {
 				const created: unknown = SettingsManager.create(ctx.cwd, this.agentDir, {
-					projectTrusted: ctx.isProjectTrusted(),
+					projectTrusted:
+						typeof ctx.isProjectTrusted === "function" ? ctx.isProjectTrusted() : true,
 				});
 				const manager = isPromiseLike(created) ? await created : created;
 				this.settingsManager = isCompatibleSettingsManager(manager) ? manager : undefined;
