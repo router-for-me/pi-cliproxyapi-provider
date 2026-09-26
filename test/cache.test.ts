@@ -979,10 +979,10 @@ describe("provider startup cache behavior", () => {
 			const staleErrorMsg =
 				"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload().";
 			const origRegisterProvider = pi.registerProvider.bind(pi);
-			pi.registerProvider = ((...args: any[]) => {
+			pi.registerProvider = ((...args: Parameters<typeof origRegisterProvider>) => {
 				if (piIsStale) throw new Error(staleErrorMsg);
 				return origRegisterProvider(...args);
-			}) as any;
+			}) as typeof origRegisterProvider;
 
 			try {
 				await providerExtension(pi);
