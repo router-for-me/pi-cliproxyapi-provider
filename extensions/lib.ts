@@ -538,6 +538,21 @@ export function toPiModel(
 	const cost = costCatalog
 		? matchModelCost(id, costCatalog, fastMode && supportsFastServiceTier(model))
 		: { ...ZERO_COST };
+	const maxTokens =
+		(typeof model.max_tokens === "number" && Number.isFinite(model.max_tokens) && model.max_tokens > 0
+			? model.max_tokens
+			: undefined) ??
+		(typeof model.max_output_tokens === "number" &&
+		Number.isFinite(model.max_output_tokens) &&
+		model.max_output_tokens > 0
+			? model.max_output_tokens
+			: undefined) ??
+		(typeof model.max_completion_tokens === "number" &&
+		Number.isFinite(model.max_completion_tokens) &&
+		model.max_completion_tokens > 0
+			? model.max_completion_tokens
+			: undefined) ??
+		DEFAULT_MAX_TOKENS;
 
 	const maxTokens =
 		(typeof model.max_tokens === "number" && Number.isFinite(model.max_tokens) && model.max_tokens > 0
