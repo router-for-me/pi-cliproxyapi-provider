@@ -398,5 +398,23 @@ describe("resolveCompactionSessionId", () => {
 	it("falls back to sessionId when sessionManager is unavailable", () => {
 		expect(resolveCompactionSessionId({ sessionId: "fallback" })).toBe("fallback");
 		expect(resolveCompactionSessionId({})).toBeUndefined();
+||||||| parent of 2a494e2 (Treat ctx.isProjectTrusted as optional on compiled hosts)
+
+it("does not throw when ctx.isProjectTrusted is missing", () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "pi-cliproxyapi-auto-compact-agent-"));
+		const cwd = mkdtempSync(join(tmpdir(), "pi-cliproxyapi-auto-compact-cwd-"));
+		tempDirs.push(agentDir, cwd);
+		const handlers = new Map<string, (event: any, ctx: ExtensionContext) => unknown>();
+		const pi = {
+			on: (event: string, handler: (event: any, ctx: ExtensionContext) => unknown) => handlers.set(event, handler),
+		} as unknown as ExtensionAPI;
+		const controller = new ProactiveCompactionController(agentDir, "cliproxyapi");
+		controller.register(pi);
+		const ctx = {
+			cwd,
+			model: { id: "gpt-5.6-sol", provider: "cliproxyapi", api: "openai-codex-responses", contextWindow: CONTEXT_WINDOW },
+			getContextUsage: () => ({ tokens: 1, contextWindow: CONTEXT_WINDOW, percent: 1 }),
+		} as unknown as ExtensionContext;
+		expect(() => handlers.get("session_start")?.({}, ctx)).not.toThrow();
 	});
 });
