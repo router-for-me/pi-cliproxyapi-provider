@@ -205,6 +205,13 @@ export class ProactiveCompactionController {
 			this.resetWebSocketSession(resolveCompactionSessionId(ctx));
 		});
 
+		pi.on("session_tree", (_event, ctx) => {
+			this.pending = undefined;
+			// Tree navigation switches the client to another branch. A reused socket
+			// would keep the abandoned branch in CLIProxyAPI's server-side context.
+			this.resetWebSocketSession(resolveCompactionSessionId(ctx));
+		});
+
 		pi.on("agent_settled", () => {
 			this.pending = undefined;
 		});
