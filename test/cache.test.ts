@@ -376,6 +376,57 @@ describe("resolveMappedModels cache behavior", () => {
 		}
 	});
 
+	it("replaceCache overwrites the cache with the fetched catalog", async () => {
+		const agentDir = tempAgentDir();
+		const cached = createMappedModels({
+			models: [createModel("gemini-3.8-flash-high"), createModel("gpt-4o")],
+			fastModelIds: ["gemini-3.8-flash-high"],
+		});
+		saveModelsCache(agentDir, cached, Date.now());
+
+		const fetchMock = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(new Response(JSON.stringify({ models: [createCodexModel("gpt-4o")] }), { status: 200 }));
+
+		try {
+			const result = await resolveMappedModels(agentDir, "http://127.0.0.1:8317", "key", {
+				forceRefresh: true,
+				replaceCache: true,
+			});
+			expect(result.fromCache).toBe(false);
+			expect(result.loaded.models.map((model) => model.id)).toEqual(["gpt-4o"]);
+			expect(result.loaded.models[0]?.stale).toBe(false);
+			expect(result.loaded.fastModelIds).not.toContain("gemini-3.8-flash-high");
+
+			const diskCache = loadModelsCache(agentDir, "http://127.0.0.1:8317");
+			expect(diskCache?.models.map((model) => model.id)).toEqual(["gpt-4o"]);
+		} finally {
+			fetchMock.mockRestore();
+		}
+	});
+
+	it("replaceCache leaves the previous cache untouched when the refresh fails", async () => {
+		const agentDir = tempAgentDir();
+		const cached = createMappedModels({ models: [createModel("cached-model")] });
+		saveModelsCache(agentDir, cached, 1);
+
+		const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network down"));
+
+		try {
+			await expect(
+				resolveMappedModels(agentDir, "http://127.0.0.1:8317", "key", {
+					forceRefresh: true,
+					replaceCache: true,
+				}),
+			).rejects.toThrow("network down");
+			expect(loadModelsCache(agentDir, "http://127.0.0.1:8317")?.models.map((model) => model.id)).toEqual([
+				"cached-model",
+			]);
+		} finally {
+			fetchMock.mockRestore();
+		}
+	});
+
 	it("retains a model from an 8-day old cache when it first goes missing", () => {
 		const eightDaysMs = 8 * 24 * 60 * 60 * 1000;
 		const eightDaysAgo = 1_000_000_000;
@@ -1116,10 +1167,12 @@ describe("/cliproxyapi-refresh command", () => {
 	it("force-refreshes models, updates the cache, and updates fast model ids", async () => {
 		await withTempAgentDir(async (agentDir) => {
 			writeConfig(agentDir, { baseUrl: "http://127.0.0.1:8317", apiKey: "key" });
-			const stale = createMappedModels({
-				models: [{ ...createModel("stale-refresh"), stale: true, staleSince: 1 }],
+			// Recent entry is still inside the stale retention window, so only replaceCache removes it.
+			const previous = createMappedModels({
+				models: [{ ...createModel("previous-model"), lastSeenAt: Date.now() }],
+				fastModelIds: ["previous-model"],
 			});
-			saveModelsCache(agentDir, stale, 1);
+			saveModelsCache(agentDir, previous, Date.now());
 
 			const fetchMock = vi
 				.spyOn(globalThis, "fetch")
@@ -1143,8 +1196,12 @@ describe("/cliproxyapi-refresh command", () => {
 				expect(notify).toHaveBeenCalledWith(expect.stringContaining("Refreshed 1 CLIProxyAPI models"), "info");
 
 				const diskCache = loadModelsCache(agentDir, "http://127.0.0.1:8317");
-				expect(diskCache?.models[0].id).toBe("refreshed");
+				expect(diskCache?.models.map((model) => model.id)).toEqual(["refreshed"]);
 				expect(diskCache?.fastModelIds).toEqual(["refreshed"]);
+				const infoMessages = notify.mock.calls
+					.filter(([, level]) => level === "info")
+					.map(([message]) => String(message));
+				expect(infoMessages.some((message) => message.includes("retained from cache"))).toBe(false);
 			} finally {
 				fetchMock.mockRestore();
 			}

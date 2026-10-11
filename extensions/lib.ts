@@ -1043,7 +1043,8 @@ export function mergeModelsWithExistingCache(
 
 /**
  * Load mapped models from the matching cache, or fetch remotely and update the cache.
- * A forced refresh always bypasses the cache.
+ * A forced refresh bypasses the cache read but still retains models missing from the
+ * fresh catalog. replaceCache writes that catalog as-is after a successful fetch.
  */
 export async function resolveMappedModels(
 	agentDir: string,
@@ -1051,6 +1052,7 @@ export async function resolveMappedModels(
 	apiKey: string,
 	options: {
 		forceRefresh?: boolean;
+		replaceCache?: boolean;
 		fastMode?: boolean;
 		signal?: AbortSignal;
 		shouldCommit?: () => boolean;
@@ -1061,14 +1063,19 @@ export async function resolveMappedModels(
 		options.fastMode === undefined || (cache.fastMode ?? false) === options.fastMode;
 
 	const existingCache = loadModelsCache(agentDir, baseUrlInput);
-	if (!options.forceRefresh) {
+	if (!options.forceRefresh && !options.replaceCache) {
 		if (existingCache && cacheMatchesFastMode(existingCache)) {
 			return { loaded: existingCache, fromCache: true };
 		}
 	}
 
 	const fresh = await loadMappedModels(baseUrlInput, apiKey, options.fastMode, agentDir, options.signal);
-	const { merged } = mergeModelsWithExistingCache(existingCache, fresh, Date.now(), options.staleTtlMs);
+	const { merged } = mergeModelsWithExistingCache(
+		options.replaceCache ? null : existingCache,
+		fresh,
+		Date.now(),
+		options.staleTtlMs,
+	);
 	if (!options.signal?.aborted && (options.shouldCommit?.() ?? true)) {
 		saveModelsCache(agentDir, merged);
 	}

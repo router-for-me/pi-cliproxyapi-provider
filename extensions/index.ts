@@ -721,6 +721,7 @@ export function registerRefreshCommand(options: {
 					const refresh = refreshCoordinator?.begin();
 					const { loaded } = await resolveMappedModels(agentDir, connection.baseUrlInput, connection.apiKey, {
 						forceRefresh: true,
+						replaceCache: true,
 						fastMode: fastMode.isEnabled(),
 						signal: refresh?.signal,
 						shouldCommit: refresh ? () => refreshCoordinator?.isCurrent(refresh.generation) ?? true : undefined,
@@ -1000,7 +1001,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const connection = resolveConnection(agentDir, identity.providerId);
 	const registerConfiguredProvider = async (
 		currentConnection: { baseUrlInput: string; apiKey: string },
-		options: { forceRefresh?: boolean } = {},
+		options: { forceRefresh?: boolean; replaceCache?: boolean } = {},
 	): Promise<RefreshResult | undefined> => {
 		const refresh = modelRefreshCoordinator.begin();
 		try {
@@ -1010,6 +1011,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				currentConnection.apiKey,
 				{
 					forceRefresh: options.forceRefresh,
+					replaceCache: options.replaceCache,
 					fastMode: fastMode.isEnabled(),
 					signal: refresh.signal,
 					shouldCommit: () => modelRefreshCoordinator.isCurrent(refresh.generation),
@@ -1101,7 +1103,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		streamSimple,
 		fastMode,
 		refreshCoordinator: modelRefreshCoordinator,
-		onRefresh: (currentConnection) => registerConfiguredProvider(currentConnection, { forceRefresh: true }),
+		onRefresh: (currentConnection) =>
+			registerConfiguredProvider(currentConnection, { forceRefresh: true, replaceCache: true }),
 	});
 
 	if (!connection) {
