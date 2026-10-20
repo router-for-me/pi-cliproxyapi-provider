@@ -16,7 +16,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { createRequire, isBuiltin } from "node:module";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Api, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 
@@ -871,6 +871,81 @@ export function wellKnownCodexModuleCandidates(homeDirectory: string): string[] 
 	];
 }
 
+const ESM_EXPORT_CONDITIONS: Record<string, true> = { bun: true, node: true, import: true, default: true };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function resolveExportTarget(target: unknown): string | undefined {
+	if (typeof target === "string") return target;
+	if (Array.isArray(target)) {
+		for (const candidate of target) {
+			const resolved = resolveExportTarget(candidate);
+			if (resolved) return resolved;
+		}
+		return undefined;
+	}
+	if (!isRecord(target)) return undefined;
+	for (const [condition, value] of Object.entries(target)) {
+		if (!Object.hasOwn(ESM_EXPORT_CONDITIONS, condition)) continue;
+		const resolved = resolveExportTarget(value);
+		if (resolved) return resolved;
+	}
+	return undefined;
+}
+
+function resolvePackageEntry(manifest: Record<string, unknown>, subpath: string): string | undefined {
+	const { exports } = manifest;
+	if (exports !== undefined) {
+		const keyed = isRecord(exports) && Object.keys(exports).some((key) => key.startsWith("."));
+		if (!keyed) return subpath === "." ? resolveExportTarget(exports) : undefined;
+		return resolveExportTarget(exports[subpath]);
+	}
+	if (subpath !== ".") return subpath;
+	for (const field of ["module", "main"]) {
+		const entry = manifest[field];
+		if (typeof entry === "string") return entry;
+	}
+	return "index.js";
+}
+
+/**
+ * Resolve a bare package specifier by walking `node_modules` and reading the
+ * package manifest. Compiled Bun hosts (the Oh My Pi binary) cannot resolve
+ * runtime node_modules through `require.resolve` or `Bun.resolveSync`.
+ *
+ * @param specifier - Bare specifier such as `partial-json` or `@scope/pkg/sub`
+ * @param importerPath - File whose ancestors are searched
+ * @returns Absolute path to the package entry
+ */
+export function resolvePackageFromNodeModules(specifier: string, importerPath: string): string {
+	const parts = specifier.split("/");
+	const nameLength = specifier.startsWith("@") ? 2 : 1;
+	const name = parts.slice(0, nameLength).join("/");
+	const subpath = parts.length > nameLength ? `./${parts.slice(nameLength).join("/")}` : ".";
+	for (let dir = dirname(importerPath); ; dir = dirname(dir)) {
+		const packageDir = join(dir, "node_modules", name);
+		const manifestPath = join(packageDir, "package.json");
+		if (existsSync(manifestPath)) {
+			const manifest: unknown = JSON.parse(readFileSync(manifestPath, "utf8"));
+			const entry = isRecord(manifest) ? resolvePackageEntry(manifest, subpath) : undefined;
+			if (entry) return join(packageDir, entry);
+		}
+		if (dirname(dir) === dir) {
+			throw new Error(`Cannot resolve package "${specifier}" from ${importerPath}`);
+		}
+	}
+}
+
+function resolveBareSpecifier(specifier: string, importerPath: string): string {
+	try {
+		return createRequire(pathToFileURL(importerPath)).resolve(specifier);
+	} catch {
+		return resolvePackageFromNodeModules(specifier, importerPath);
+	}
+}
+
 /**
  * Rewrite one module so relative and bare imports become absolute file URLs
  * resolved from `originalPath`'s package graph.
@@ -880,7 +955,6 @@ export function wellKnownCodexModuleCandidates(homeDirectory: string): string[] 
  * @returns Source with resolvable file URL imports
  */
 export function rewritePatchedModuleImports(source: string, originalPath: string): string {
-	const requireFromOriginal = createRequire(pathToFileURL(originalPath));
 	const originalDir = dirname(originalPath);
 	return stripSourceMappingUrl(
 		source.replace(IMPORT_FROM_SPECIFIER, (full, _quote: string, specifier: string) => {
@@ -890,8 +964,7 @@ export function rewritePatchedModuleImports(source: string, originalPath: string
 			if (specifier.startsWith(".")) {
 				return `from ${JSON.stringify(pathToFileURL(join(originalDir, specifier)).href)}`;
 			}
-			const resolved = requireFromOriginal.resolve(specifier);
-			return `from ${JSON.stringify(pathToFileURL(resolved).href)}`;
+			return `from ${JSON.stringify(pathToFileURL(resolveBareSpecifier(specifier, originalPath)).href)}`;
 		}),
 	);
 }
@@ -1086,6 +1159,65 @@ export function resolveCodexModuleFromNodeEntry(entryPath: string): string | und
 	return undefined;
 }
 
+export type BunPluginRuntime = {
+	plugin(options: {
+		name: string;
+		setup(build: {
+			onLoad(
+				constraints: { filter: RegExp; namespace?: string },
+				callback: (args: { path: string }) => { contents: string; loader: "js" },
+			): void;
+		}): void;
+	}): void;
+};
+
+const bareImportResolverRoots = new Set<string>();
+
+function currentBunRuntime(): BunPluginRuntime | undefined {
+	const bun: unknown = Reflect.get(globalThis, "Bun");
+	if (!bun || typeof bun !== "object" || !("plugin" in bun) || typeof bun.plugin !== "function") return undefined;
+	// @types/node has no Bun typings; only Bun.plugin's onLoad surface is used.
+	const runtime = bun as BunPluginRuntime;
+	return runtime;
+}
+
+function findPackageRoot(filePath: string): string {
+	for (let dir = dirname(filePath); ; dir = dirname(dir)) {
+		if (existsSync(join(dir, "package.json"))) return dir;
+		if (dirname(dir) === dir) return dirname(filePath);
+	}
+}
+
+/**
+ * Compiled Bun hosts (the Oh My Pi binary) do not resolve node_modules for
+ * modules imported at runtime outside the extension graph, so bare imports
+ * inside the physical pi-ai package (e.g. `partial-json`) fail to load.
+ * Rewriting each pi-ai module's imports in place, rather than copying
+ * modules, keeps module identity shared with every other importer.
+ *
+ * @param originalPath - Physical openai-codex-responses.js the patched module imports from
+ * @param bun - Bun runtime; Node hosts resolve natively and skip this
+ */
+export function installBareImportResolver(
+	originalPath: string,
+	bun: BunPluginRuntime | undefined = currentBunRuntime(),
+): void {
+	if (!bun) return;
+	const root = findPackageRoot(realpathSync(originalPath));
+	if (bareImportResolverRoots.has(root)) return;
+	bareImportResolverRoots.add(root);
+	const escapedRoot = `${root}${sep}`.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	bun.plugin({
+		name: `pi-cliproxyapi-provider:bare-imports:${root}`,
+		setup(build) {
+			build.onLoad({ filter: new RegExp(`^${escapedRoot}.*\\.m?js$`), namespace: "file" }, ({ path }) => ({
+				contents: rewritePatchedModuleImports(readFileSync(path, "utf8"), path),
+				loader: "js",
+			}));
+		},
+	});
+}
+
 export function computePatchedModuleCachePath(
 	originalPath: string,
 	patchedSource: string,
@@ -1218,6 +1350,7 @@ export async function loadCliproxyCodexStreams(
 	if (!existsSync(outPath)) {
 		writePatchedModuleCache(outPath, patched, originalPath);
 	}
+	installBareImportResolver(originalPath);
 
 	const mod = (await import(pathToFileURL(outPath).href)) as {
 		streamSimple: CliproxyCodexStreamSimple;
