@@ -4,8 +4,10 @@ import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	type BunPluginRuntime,
 	computePatchedModuleCachePath,
 	hasNativeMidConvoEffort,
+	installBareImportResolver,
 	loadCliproxyCodexStreams,
 	MID_CONVO_BASELINE_EFFORT,
 	patchCodexSource,
@@ -13,6 +15,7 @@ import {
 	resolveCodexModuleFromNodeEntry,
 	resolveConfigurationUpdateEffort,
 	resolveOriginalCodexModulePath,
+	resolvePackageFromNodeModules,
 	sharedSupportsConfigurationUpdate,
 	wellKnownCodexModuleCandidates,
 	writePatchedModuleCache,
@@ -388,6 +391,66 @@ export function registerHook(fn) { registerCleanup(fn); }
 			streamSimple: () => { ok: boolean; text: string };
 		};
 		expect(loadedB.streamSimple()).toEqual({ ok: true, text: '{"ok":' });
+	});
+});
+
+describe("resolvePackageFromNodeModules", () => {
+	it("walks up from the importer and prefers ESM export conditions for root and subpath imports", () => {
+		const root = tempDir("pi-cpa-resolve-exports-");
+		const packageDir = join(root, "node_modules", "@scope", "dual");
+		writeFile(
+			join(packageDir, "package.json"),
+			JSON.stringify({
+				name: "@scope/dual",
+				exports: {
+					".": { types: "./index.d.ts", require: "./index.cjs", import: "./index.mjs" },
+					"./sub": { default: "./sub.js" },
+				},
+			}),
+		);
+		const importer = join(root, "node_modules", "consumer", "dist", "deep", "file.js");
+
+		expect(resolvePackageFromNodeModules("@scope/dual", importer)).toBe(join(packageDir, "index.mjs"));
+		expect(resolvePackageFromNodeModules("@scope/dual/sub", importer)).toBe(join(packageDir, "sub.js"));
+	});
+
+	it("falls back to module/main without exports and fails for missing packages", () => {
+		const root = tempDir("pi-cpa-resolve-main-");
+		writeFile(
+			join(root, "node_modules", "legacy", "package.json"),
+			JSON.stringify({ name: "legacy", main: "lib/main.js", module: "es/main.js" }),
+		);
+		const importer = join(root, "src", "file.js");
+
+		expect(resolvePackageFromNodeModules("legacy", importer)).toBe(
+			join(root, "node_modules", "legacy", "es/main.js"),
+		);
+		expect(() => resolvePackageFromNodeModules("absent", importer)).toThrow(/Cannot resolve package "absent"/);
+	});
+});
+
+describe("installBareImportResolver", () => {
+	it("rewrites bare imports only for modules inside the original pi-ai package", () => {
+		const home = tempDir("pi-cpa-bun-hook-");
+		const { codexPath, jsonParsePath, partialJsonPath } = writeOmpPluginsCodexTree(home);
+		writeFile(
+			join(dirname(dirname(dirname(codexPath))), "package.json"),
+			JSON.stringify({ name: "@earendil-works/pi-ai" }),
+		);
+		const hooks: Array<{ filter: RegExp; load: (args: { path: string }) => { contents: string } }> = [];
+		const bun: BunPluginRuntime = {
+			plugin: ({ setup }) => setup({ onLoad: ({ filter }, load) => hooks.push({ filter, load }) }),
+		};
+
+		installBareImportResolver(codexPath, bun);
+
+		expect(hooks).toHaveLength(1);
+		const [{ filter, load }] = hooks;
+		expect(filter.test(jsonParsePath)).toBe(true);
+		expect(filter.test(partialJsonPath)).toBe(false);
+		const { contents } = load({ path: jsonParsePath });
+		expect(contents).toContain(`from ${JSON.stringify(pathToFileURL(partialJsonPath).href)}`);
+		expect(contents).not.toContain('from "partial-json"');
 	});
 });
 
