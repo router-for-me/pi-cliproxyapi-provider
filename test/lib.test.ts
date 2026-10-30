@@ -497,6 +497,7 @@ describe("config and auth file helpers", () => {
 		);
 
 		expect(loadAuthConnection(agentDir, "cliproxyapi")).toEqual({
+			type: "oauth",
 			apiKey: "sk-test",
 			baseUrl: "http://127.0.0.1:8317",
 		});
@@ -516,6 +517,7 @@ describe("config and auth file helpers", () => {
 		);
 
 		expect(loadAuthConnection(agentDir, "cliproxyapi")).toEqual({
+			type: "api_key",
 			apiKey: "plain-key",
 		});
 	});

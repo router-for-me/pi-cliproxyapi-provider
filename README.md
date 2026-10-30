@@ -120,6 +120,38 @@ Resolution order for connection settings:
 
 The Fast preference resolves separately as `CLIPROXYAPI_FAST` → `cliproxyapi.json` → `false`.
 
+### API keys from secret managers
+
+In `cliproxyapi.json`, prefix `apiKey` with `!` to use a shell command's standard output instead of storing a plaintext key:
+
+```json
+{
+  "baseUrl": "https://proxy.example",
+  "apiKey": "!op read 'op://dev/cliproxyapi/key'"
+}
+```
+
+This works with 1Password CLI or any command that prints a key. Configure and authorize the secret manager first; if you use multiple 1Password accounts, include `--account` in the command.
+
+Alternatively, put the command in an API-key credential in `auth.json`:
+
+```json
+{
+  "cliproxyapi": {
+    "type": "api_key",
+    "key": "!op read 'op://dev/cliproxyapi/key'"
+  }
+}
+```
+
+For this alternative, keep `baseUrl` in `cliproxyapi.json` but omit its `apiKey`, which otherwise takes precedence. Remove any stale plaintext API-key override from `models.json` too.
+
+The plugin runs only the selected command, using the system's default shell with a 10-second timeout and no stdin. It trims stdout and caches successful results in memory for the process lifetime, including across model refreshes. Restart Pi after rotating a key without changing its command. Command failure or empty output stops resolution without falling back to another credential; command details and output are omitted from the error.
+
+The resolved key is not written back to configuration or the model cache. Configure commands in files, not through `/login`, whose existing flow saves the key you enter. Environment-variable keys and OAuth access tokens remain literal values, never commands.
+
+Only use commands you trust: they execute with Pi's permissions. This avoids plaintext credential configuration, not access to the key by trusted extensions or processes running inside Pi.
+
 ### baseUrl normalization
 
 Preferred form is **host:port only**:

@@ -232,7 +232,7 @@ function findActiveCompatEntry(
 
 function hasLoginCredential(agentDir: string, providerId: string): boolean {
 	try {
-		return Boolean(loadAuthConnection(agentDir, providerId)?.apiKey);
+		return loadAuthConnection(agentDir, providerId)?.type === "oauth";
 	} catch {
 		return false;
 	}

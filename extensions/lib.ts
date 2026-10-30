@@ -2,6 +2,7 @@
  * Pure helpers for CLIProxyAPI baseUrl normalization, model mapping, and config I/O.
  */
 
+import { execSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -350,20 +351,47 @@ export function saveModelsCache(agentDir: string, loaded: MappedModels, fetchedA
 	writeFileSync(cachePath, `${JSON.stringify({ ...loaded, fetchedAt }, null, 2)}\n`, "utf8");
 }
 
-export function loadAuthConnection(agentDir: string, providerId: string): { baseUrl?: string; apiKey?: string } | null {
+export function loadAuthConnection(
+	agentDir: string,
+	providerId: string,
+): { type: "oauth" | "api_key"; baseUrl?: string; apiKey?: string } | null {
 	const entry = readStoredCredential(providerId, join(agentDir, AUTH_FILE_NAME));
 	if (entry?.type === "oauth" && typeof entry.access === "string" && entry.access.trim()) {
 		const meta = decodeRefreshMeta(typeof entry.refresh === "string" ? entry.refresh : undefined);
 		return {
+			type: "oauth",
 			apiKey: entry.access.trim(),
 			baseUrl: meta?.baseUrl,
 		};
 	}
 
 	if (entry?.type === "api_key" && typeof entry.key === "string" && entry.key.trim()) {
-		return { apiKey: entry.key.trim() };
+		return { type: "api_key", apiKey: entry.key.trim() };
 	}
 	return null;
+}
+
+const apiKeyCommandCache = new Map<string, string>();
+
+function resolveApiKeyCommand(value: string | undefined): string | undefined {
+	if (!value?.startsWith("!")) return value;
+	const cached = apiKeyCommandCache.get(value);
+	if (cached !== undefined) return cached;
+
+	try {
+		const key = execSync(value.slice(1), {
+			encoding: "utf8",
+			timeout: 10_000,
+			stdio: ["ignore", "pipe", "ignore"],
+		}).trim();
+		if (key) {
+			apiKeyCommandCache.set(value, key);
+			return key;
+		}
+	} catch {
+		// Shell errors can include the command, stdout, and secrets from stderr.
+	}
+	throw new Error("Failed to resolve CLIProxyAPI API key command. Check the command and its authorization.");
 }
 
 export function resolveIdentity(agentDir: string): ResolvedIdentity {
@@ -442,7 +470,7 @@ export function resolveConnection(agentDir: string, providerId: string): Resolve
 		file = {};
 	}
 
-	let auth: { baseUrl?: string; apiKey?: string } | null = null;
+	let auth: ReturnType<typeof loadAuthConnection> = null;
 	try {
 		auth = loadAuthConnection(agentDir, providerId);
 	} catch {
@@ -450,7 +478,10 @@ export function resolveConnection(agentDir: string, providerId: string): Resolve
 	}
 
 	const baseUrlInput = firstNonEmpty(process.env.CLIPROXYAPI_BASE_URL, file.baseUrl, auth?.baseUrl, DEFAULT_BASE_URL)!;
-	const apiKey = firstNonEmpty(process.env.CLIPROXYAPI_API_KEY, file.apiKey, auth?.apiKey);
+	const envKey = firstNonEmpty(process.env.CLIPROXYAPI_API_KEY);
+	const fileKey = firstNonEmpty(file.apiKey);
+	const apiKey =
+		envKey ?? (!fileKey && auth?.type === "oauth" ? auth.apiKey : resolveApiKeyCommand(fileKey ?? auth?.apiKey));
 	if (!apiKey) {
 		return null;
 	}

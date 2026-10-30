@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -119,6 +119,56 @@ describe("pi 0.82.0 compatibility", () => {
 				for (const [, config] of (pi.registerProvider as ReturnType<typeof vi.fn>).mock.calls) {
 					expect(config).not.toHaveProperty("apiKey");
 				}
+			} finally {
+				fetchMock.mockRestore();
+			}
+		});
+	});
+
+	it.each(["config", "auth"])("uses a %s key command for discovery and inference across refreshes", async (source) => {
+		await withTempAgentDir(async (agentDir) => {
+			const script = join(agentDir, "secret.cjs");
+			const calls = join(agentDir, "command-calls.txt");
+			writeFileSync(
+				script,
+				`require("node:fs").appendFileSync(${JSON.stringify(calls)}, "called\\n"); process.stdout.write("resolved-test-key");`,
+			);
+			const command = `!"${process.execPath}" "${script}"`;
+			const configPath = join(agentDir, "cliproxyapi.json");
+			writeFileSync(
+				configPath,
+				JSON.stringify({ baseUrl: "https://proxy.example", ...(source === "config" ? { apiKey: command } : {}) }),
+			);
+			if (source === "auth") {
+				writeFileSync(
+					join(agentDir, AUTH_FILE_NAME),
+					JSON.stringify({ cliproxyapi: { type: "api_key", key: command } }),
+				);
+			}
+			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const { pi } = createPiMock(commands);
+			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response('{"models":[]}'));
+			try {
+				await providerExtension(pi);
+				expect(pi.registerProvider).toHaveBeenLastCalledWith(
+					"cliproxyapi",
+					expect.objectContaining({ apiKey: "resolved-test-key" }),
+				);
+				const refresh = commands.get("cliproxyapi-refresh");
+				if (!refresh) throw new Error("Refresh command unavailable");
+				await refresh.handler("", { ui: { notify: vi.fn() } } as unknown as ExtensionCommandContext);
+				const catalogCalls = fetchMock.mock.calls.filter(([url]) =>
+					String(url).startsWith("https://proxy.example/"),
+				);
+				expect(catalogCalls).toHaveLength(2);
+				for (const [, options] of catalogCalls) {
+					expect(options?.headers).toEqual(expect.objectContaining({ Authorization: "Bearer resolved-test-key" }));
+				}
+				expect(readFileSync(calls, "utf8")).toBe("called\n");
+				const credentialPath = source === "config" ? configPath : join(agentDir, AUTH_FILE_NAME);
+				const stored = JSON.parse(readFileSync(credentialPath, "utf8"));
+				expect(source === "config" ? stored.apiKey : stored.cliproxyapi.key).toBe(command);
+				expect(readFileSync(join(agentDir, "cliproxyapi-models.json"), "utf8")).not.toContain("resolved-test-key");
 			} finally {
 				fetchMock.mockRestore();
 			}
