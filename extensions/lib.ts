@@ -539,11 +539,19 @@ export function toPiModel(
 
 	const efforts = extractReasoningEfforts(model);
 	const hasReasoning = efforts.some((effort) => effort !== "none");
+	// Devin's /v1/models self-reports swe-2 context_window as 262000/262144, but the
+	// model accepts ≥950k prompt tokens in practice (Kimi K3 base = 1M). Override the
+	// advertised value so pi's footer and auto-compact use the real ceiling.
+	// See https://github.com/router-for-me/pi-cliproxyapi-provider/issues/49
 	const contextWindow =
-		(typeof model.context_window === "number" && model.context_window > 0 ? model.context_window : undefined) ??
-		(typeof model.max_context_window === "number" && model.max_context_window > 0
-			? model.max_context_window
-			: undefined) ??
+		(id.startsWith("devin/swe-2")
+			? 1048576
+			: (typeof model.context_window === "number" && model.context_window > 0
+					? model.context_window
+					: undefined) ??
+				(typeof model.max_context_window === "number" && model.max_context_window > 0
+					? model.max_context_window
+					: undefined)) ??
 		DEFAULT_CONTEXT_WINDOW;
 
 	const cost = costCatalog
