@@ -38,6 +38,7 @@ import {
 import { FastModeController } from "./fast.ts";
 import { FastFooterController } from "./fast-footer.ts";
 import {
+	ANTHROPIC_MESSAGES_API,
 	CONFIG_FILE_NAME,
 	CREDENTIAL_TTL_MS,
 	DEFAULT_BASE_URL,
@@ -51,6 +52,7 @@ import {
 	loadConfiguredDefaultSettings,
 	type MappedModels,
 	type PiProviderModel,
+	resolveClaudeMessagesDefault,
 	resolveConnection,
 	resolveEndpoints,
 	resolveFastDefault,
@@ -333,6 +335,7 @@ async function configureAndRegister(options: {
 	const { loaded } = await resolveMappedModels(agentDir, baseUrlInput, apiKey, {
 		forceRefresh: true,
 		fastMode: fastMode.isEnabled(),
+		claudeMessages: resolveClaudeMessagesDefault(agentDir),
 		signal: refresh.signal,
 		shouldCommit: () => refreshCoordinator.isCurrent(refresh.generation),
 	});
@@ -471,9 +474,11 @@ function createOAuthHandlers(options: {
 				return models;
 			}
 			try {
-				const { inferenceBaseUrl } = resolveEndpoints(meta.baseUrl);
+				const { inferenceBaseUrl, messagesBaseUrl } = resolveEndpoints(meta.baseUrl);
 				return models.map((model) =>
-					model.provider === providerId ? { ...model, baseUrl: inferenceBaseUrl } : model,
+					model.provider === providerId
+						? { ...model, baseUrl: model.api === ANTHROPIC_MESSAGES_API ? messagesBaseUrl : inferenceBaseUrl }
+						: model,
 				);
 			} catch {
 				return models;
@@ -542,7 +547,13 @@ function registerProvider(
 		// (config file / env). Never pass both for /login flows.
 		oauth,
 		...(apiKey ? { apiKey } : {}),
-		...(models && models.length > 0 ? { models } : {}),
+		...(models && models.length > 0
+			? {
+					models: models.map((model) =>
+						model.api === ANTHROPIC_MESSAGES_API ? { ...model, baseUrl: endpoints.messagesBaseUrl } : model,
+					),
+				}
+			: {}),
 	});
 }
 
@@ -724,6 +735,7 @@ export function registerRefreshCommand(options: {
 						forceRefresh: true,
 						replaceCache: true,
 						fastMode: fastMode.isEnabled(),
+						claudeMessages: resolveClaudeMessagesDefault(agentDir),
 						signal: refresh?.signal,
 						shouldCommit: refresh ? () => refreshCoordinator?.isCurrent(refresh.generation) ?? true : undefined,
 					});
@@ -1018,6 +1030,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 					forceRefresh: options.forceRefresh,
 					replaceCache: options.replaceCache,
 					fastMode: fastMode.isEnabled(),
+					claudeMessages: resolveClaudeMessagesDefault(agentDir),
 					signal: refresh.signal,
 					shouldCommit: () => modelRefreshCoordinator.isCurrent(refresh.generation),
 				},

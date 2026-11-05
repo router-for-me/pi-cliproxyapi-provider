@@ -71,7 +71,7 @@ function tempAgentDir(): string {
 	return dir;
 }
 
-function writeConfig(agentDir: string, config: { baseUrl?: string; apiKey?: string }): void {
+function writeConfig(agentDir: string, config: { baseUrl?: string; apiKey?: string; claudeMessages?: boolean }): void {
 	writeFileSync(join(agentDir, CONFIG_FILE_NAME), JSON.stringify(config, null, 2), "utf8");
 }
 
@@ -511,6 +511,44 @@ describe("provider startup cache behavior", () => {
 
 				const diskCache = loadModelsCache(agentDir, "http://127.0.0.1:8317");
 				expect(diskCache?.models[0].id).toBe("startup-remote");
+			} finally {
+				fetchMock.mockRestore();
+			}
+		});
+	});
+
+	it("registers Claude-format models with the Claude Messages base URL when claudeMessages is on", async () => {
+		await withTempAgentDir(async (agentDir) => {
+			writeConfig(agentDir, { baseUrl: "http://127.0.0.1:8317", apiKey: "key", claudeMessages: true });
+			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+				const url = String(input);
+				if (url.includes("models.dev")) return new Response("{}", { status: 200 });
+				if (url.includes("client_version")) {
+					return new Response(
+						JSON.stringify({ models: [createCodexModel("claude-haiku-4-5"), createCodexModel("gpt-remote")] }),
+						{ status: 200 },
+					);
+				}
+				return new Response(
+					JSON.stringify({
+						data: [
+							{ id: "claude-haiku-4-5", owned_by: "anthropic" },
+							{ id: "gpt-remote", owned_by: "openai" },
+						],
+					}),
+					{ status: 200 },
+				);
+			});
+			const { pi } = createPiMock();
+			try {
+				await providerExtension(pi);
+				const calls = (pi.registerProvider as unknown as { mock: { calls: any[][] } }).mock.calls;
+				const models = calls.at(-1)?.[1]?.models as Array<{ id: string; api?: string; baseUrl?: string }>;
+				const claude = models.find((m) => m.id === "claude-haiku-4-5");
+				const gpt = models.find((m) => m.id === "gpt-remote");
+				expect(claude).toMatchObject({ api: "anthropic-messages", baseUrl: "http://127.0.0.1:8317" });
+				expect(gpt?.api).toBeUndefined();
+				expect(gpt?.baseUrl).toBeUndefined();
 			} finally {
 				fetchMock.mockRestore();
 			}
