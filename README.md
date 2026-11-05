@@ -110,6 +110,7 @@ Optional fields:
 | `CLIPROXYAPI_PROVIDER_ID` | `providerId` |
 | `CLIPROXYAPI_PROVIDER_NAME` | `providerName` |
 | `CLIPROXYAPI_FAST` | `fast` (`true` / `false`, also accepts `1`, `0`, `yes`, `no`, `on`, `off`) |
+| `CLIPROXYAPI_CLAUDE_MESSAGES` | `claudeMessages` (same values as `CLIPROXYAPI_FAST`) |
 
 Resolution order for connection settings:
 
@@ -241,6 +242,26 @@ plugin declares `promptCache.short` for every model whose lifetime is known:
 The models.dev v2 lifetimes are cached for 24 hours at `~/.pi/agent/tmp/models-dev-prompt-cache.json` (only the parsed
 lifetimes, not the full file), with the same stale-copy fallback as prices. Lifetimes are loaded together with prices, so
 `/cliproxyapi-refresh` updates both.
+
+## Claude Messages format (opt-in)
+
+By default every model, Claude included, is sent in the Codex Responses format. With `"claudeMessages": true` in
+`cliproxyapi.json` (or `CLIPROXYAPI_CLAUDE_MESSAGES=1`), Claude models are sent in Claude's own format to CLIProxyAPI's
+`/v1/messages` instead, using pi's built-in Anthropic client.
+
+- **Which models:** those CLIProxyAPI lists with `owned_by: "anthropic"` (from its plain `/v1/models`) that pi's
+  built-in catalog also knows. Their compat flags, thinking levels and cache tiers come from that catalog. Every other
+  model, and Claude models pi doesn't know, stay on the Codex format. Pool aliases work: CLIProxyAPI translates the
+  request for non-Claude members (verified with Devin and an OpenAI-compatible OpenRouter entry).
+- **Why:** Claude's format can carry Anthropic features the Codex format can't. The main one is the **1-hour cache**:
+  with `PI_CACHE_RETENTION=long`, pi marks the prompt with `cache_control` `ttl: "1h"`, CLIProxyAPI passes it through,
+  and Anthropic writes the 1-hour tier, on API keys too. These models declare `promptCache: { short: 300, long: 3600 }`,
+  so pi plans warming accordingly (with `long`, the first refresh would fall past pi's 30-minute idle limit, so idle
+  sessions aren't warmed at all). One-hour cache writes cost 2× the input price instead of 1.25×.
+- **Not available for these models:** Fast mode (a Codex service tier) and the Codex WebSocket transport. Thinking,
+  tools, images, warming, the no-cache guard and auto-compaction work as before.
+- Toggling the option refreshes the model list (the cache records it). The first request of an ongoing session after
+  switching formats is a cache miss.
 
 ## Migration from static models.json
 

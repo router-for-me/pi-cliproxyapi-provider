@@ -12,10 +12,15 @@ export type ThinkingLevelMap = Partial<
 	Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra", string | null>
 >;
 
-// Local subset of pi OpenAIResponsesCompat; only the flags this plugin emits.
+// Local subset of pi model compat flags: OpenAIResponsesCompat for Codex-format models,
+// AnthropicMessagesCompat (copied from pi's catalog) for Claude-format models.
 export interface PiProviderModelCompat {
 	supportsMidConvoEffort?: boolean;
+	[key: string]: unknown;
 }
+
+/** pi API id used for Claude models when the Claude Messages format is enabled. */
+export const ANTHROPIC_MESSAGES_API = "anthropic-messages";
 
 export const DEFAULT_PROVIDER_ID = "cliproxyapi";
 export const DEFAULT_PROVIDER_NAME = "CLIProxyAPI";
@@ -44,6 +49,7 @@ export interface CliproxyConfigFile {
 	providerName?: string;
 	fast?: boolean;
 	pause?: boolean;
+	claudeMessages?: boolean;
 }
 
 export interface ResolvedIdentity {
@@ -130,6 +136,8 @@ export interface PiProviderModel {
 	thinkingLevelMap?: ThinkingLevelMap;
 	compat?: PiProviderModelCompat;
 	promptCache?: PiProviderModelPromptCache;
+	/** Set to "anthropic-messages" for Claude models sent in Claude's own format; unset = the Codex format. */
+	api?: string;
 	stale?: boolean;
 	lastSeenAt?: number;
 	staleSince?: number;
@@ -141,6 +149,7 @@ export interface MappedModels {
 	inferenceBaseUrl: string;
 	modelsUrl: string;
 	fastMode?: boolean;
+	claudeMessages?: boolean;
 }
 
 export interface ModelsCacheFile extends MappedModels {
@@ -204,6 +213,10 @@ export function resolveEndpoints(baseUrlInput: string): {
 	inferenceBaseUrl: string;
 	modelsUrl: string;
 	rootOrigin: string;
+	/** Base URL for Claude Messages requests (the client appends /v1/messages). */
+	messagesBaseUrl: string;
+	/** Plain OpenAI model list, which carries owned_by. */
+	plainModelsUrl: string;
 } {
 	let raw = baseUrlInput.trim();
 	if (!raw) {
@@ -235,6 +248,8 @@ export function resolveEndpoints(baseUrlInput: string): {
 		inferenceBaseUrl,
 		modelsUrl,
 		rootOrigin: url.origin,
+		messagesBaseUrl: `${url.origin}${rootPath}`,
+		plainModelsUrl: `${url.origin}${modelsPath}`,
 	};
 }
 
@@ -428,6 +443,26 @@ export function resolveFastDefault(agentDir: string): boolean {
 	return file.fast;
 }
 
+/** Resolve the Claude Messages preference from env, then cliproxyapi.json, then false. */
+export function resolveClaudeMessagesDefault(agentDir: string): boolean {
+	const envValue = firstNonEmpty(process.env.CLIPROXYAPI_CLAUDE_MESSAGES);
+	if (envValue !== undefined) {
+		const parsed = parseBooleanSetting(envValue);
+		if (parsed === undefined) {
+			throw new Error("CLIPROXYAPI_CLAUDE_MESSAGES must be one of: true, false, 1, 0, yes, no, on, off");
+		}
+		return parsed;
+	}
+	const file = loadConfigFile(agentDir);
+	if (file.claudeMessages === undefined) {
+		return false;
+	}
+	if (typeof file.claudeMessages !== "boolean") {
+		throw new Error(`${CONFIG_FILE_NAME} field "claudeMessages" must be a boolean`);
+	}
+	return file.claudeMessages;
+}
+
 /** Resolve the request pause preference from cliproxyapi.json, defaulting to false. */
 export function resolvePauseDefault(agentDir: string): boolean {
 	const file = loadConfigFile(agentDir);
@@ -539,6 +574,7 @@ export function toPiModel(
 	costCatalog?: ModelsDevCostCatalog,
 	fastMode = false,
 	promptCacheSources?: PromptCacheSources,
+	claudeFormat?: ClaudeFormatEntry,
 ): PiProviderModel | null {
 	const id = codexModelId(model);
 	if (!id) {
@@ -577,14 +613,36 @@ export function toPiModel(
 			: undefined) ??
 		DEFAULT_MAX_TOKENS;
 
-	const reportedCache = withReportedCacheLifetime(
+	const resolvedCache = withReportedCacheLifetime(
 		promptCacheSources ? resolvePromptCache(id, promptCacheSources) : undefined,
 		model.prompt_cache_ttl_seconds,
 	);
+	if (claudeFormat) {
+		// Claude's own format carries the long tier (cache_control ttl "1h"), so declare it too.
+		const promptCache = {
+			...((resolvedCache?.short ?? claudeFormat.promptCache?.short)
+				? { short: resolvedCache?.short ?? claudeFormat.promptCache?.short }
+				: {}),
+			...(claudeFormat.promptCache?.long ? { long: claudeFormat.promptCache.long } : {}),
+		};
+		return {
+			id,
+			name: (model.display_name ?? model.name ?? id).trim() || id,
+			api: ANTHROPIC_MESSAGES_API,
+			reasoning: claudeFormat.reasoning,
+			input: buildInputModalities(model),
+			cost,
+			contextWindow,
+			maxTokens,
+			...(claudeFormat.thinkingLevelMap ? { thinkingLevelMap: { ...claudeFormat.thinkingLevelMap } } : {}),
+			...(claudeFormat.compat ? { compat: { ...claudeFormat.compat } } : {}),
+			...(Object.keys(promptCache).length > 0 ? { promptCache } : {}),
+		};
+	}
 	// The Codex format sends the same request whatever the cache retention (PI_CACHE_RETENTION=long changes nothing
 	// on the wire), so the route keeps one lifetime. Declare it for both tiers: without a long tier, pi would treat
 	// "long" as an unknown lifetime and stop warming these models.
-	const promptCache = reportedCache?.short ? { short: reportedCache.short, long: reportedCache.short } : reportedCache;
+	const promptCache = resolvedCache?.short ? { short: resolvedCache.short, long: resolvedCache.short } : resolvedCache;
 
 	return {
 		id,
@@ -1231,31 +1289,155 @@ export async function loadPromptCacheSources(
 	return { builtin, modelsDev };
 }
 
+// ---------------------------------------------------------------------------
+// Claude Messages format (opt-in)
+//
+// CPA accepts Claude's own format at /v1/messages. Sending Claude models in that
+// format lets pi use Anthropic features the Codex format can't express, such as
+// the 1-hour cache tier (PI_CACHE_RETENTION=long → cache_control ttl "1h"), which
+// CPA passes through untouched. A model uses it when CPA lists it as owned by
+// Anthropic and pi's built-in catalog knows the model (its compat flags, thinking
+// levels and cache tiers are copied); anything else stays on the Codex format.
+// ---------------------------------------------------------------------------
+
+export interface ClaudeFormatEntry {
+	reasoning: boolean;
+	compat?: PiProviderModelCompat;
+	thinkingLevelMap?: ThinkingLevelMap;
+	promptCache?: PiProviderModelPromptCache;
+}
+
+interface BuiltinAnthropicModel {
+	id?: string;
+	reasoning?: boolean;
+	compat?: Record<string, unknown>;
+	thinkingLevelMap?: ThinkingLevelMap;
+	promptCache?: PiProviderModelPromptCache;
+}
+
+export interface ClaudeFormatCatalog {
+	exact: Map<string, ClaudeFormatEntry>;
+	normalized: Map<string, ClaudeFormatEntry>;
+}
+
+export function buildClaudeFormatCatalog(models: ReadonlyArray<BuiltinAnthropicModel>): ClaudeFormatCatalog {
+	const catalog: ClaudeFormatCatalog = { exact: new Map(), normalized: new Map() };
+	for (const model of models) {
+		const id = model.id?.trim().toLowerCase();
+		if (!id) continue;
+		const entry: ClaudeFormatEntry = {
+			reasoning: model.reasoning === true,
+			...(model.compat ? { compat: { ...model.compat } } : {}),
+			...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}),
+			...(model.promptCache ? { promptCache: { ...model.promptCache } } : {}),
+		};
+		if (!catalog.exact.has(id)) catalog.exact.set(id, entry);
+		const key = normalizeModelKey(id);
+		if (key && !catalog.normalized.has(key)) catalog.normalized.set(key, entry);
+	}
+	return catalog;
+}
+
+export function findClaudeFormatEntry(modelId: string, catalog: ClaudeFormatCatalog): ClaudeFormatEntry | undefined {
+	const rawId = modelId.trim().toLowerCase();
+	return (
+		catalog.exact.get(rawId) ??
+		catalog.exact.get(stripModelNamespace(rawId)) ??
+		catalog.normalized.get(normalizeModelKey(rawId))
+	);
+}
+
+/** pi's built-in Anthropic models via the pi-ai peer; empty on pi versions without it. */
+export async function loadBuiltinClaudeFormatCatalog(): Promise<ClaudeFormatCatalog> {
+	try {
+		const builtins = (await import("@earendil-works/pi-ai/providers/all")) as {
+			getBuiltinModels?: (provider: string) => BuiltinAnthropicModel[];
+		};
+		if (typeof builtins.getBuiltinModels !== "function") {
+			return buildClaudeFormatCatalog([]);
+		}
+		return buildClaudeFormatCatalog(builtins.getBuiltinModels("anthropic") ?? []);
+	} catch {
+		return buildClaudeFormatCatalog([]);
+	}
+}
+
+/** Model id → owned_by from CPA's plain OpenAI model list. Empty on any failure. */
+export async function fetchModelOwners(
+	plainModelsUrl: string,
+	apiKey: string,
+	timeoutMs = MODELS_REQUEST_TIMEOUT_MS,
+	signal?: AbortSignal,
+): Promise<Map<string, string>> {
+	const owners = new Map<string, string>();
+	try {
+		const timeoutSignal = AbortSignal.timeout(timeoutMs);
+		const response = await fetch(plainModelsUrl, {
+			headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+			signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
+		});
+		if (!response.ok) return owners;
+		const data = asRecord(await response.json())?.data;
+		for (const item of Array.isArray(data) ? data : []) {
+			const record = asRecord(item);
+			const id = typeof record?.id === "string" ? record.id.trim() : "";
+			const ownedBy = typeof record?.owned_by === "string" ? record.owned_by.trim().toLowerCase() : "";
+			if (id && ownedBy) owners.set(id, ownedBy);
+		}
+	} catch {
+		// Without owners every model stays on the Codex format.
+	}
+	return owners;
+}
+
+/** The Claude-format entry for a model, or undefined when it stays on the Codex format. */
+export function claudeFormatFor(
+	modelId: string,
+	owners: Map<string, string>,
+	catalog: ClaudeFormatCatalog,
+): ClaudeFormatEntry | undefined {
+	if (owners.get(modelId) !== "anthropic") return undefined;
+	return findClaudeFormatEntry(modelId, catalog);
+}
+
 export async function loadMappedModels(
 	baseUrlInput: string,
 	apiKey: string,
 	timeoutOrFastMode: number | boolean = MODELS_REQUEST_TIMEOUT_MS,
 	agentDir?: string,
 	signal?: AbortSignal,
+	claudeMessages = false,
 ): Promise<MappedModels> {
 	const pricingEnabled = typeof timeoutOrFastMode === "boolean";
 	const effectiveFastMode = typeof timeoutOrFastMode === "boolean" ? timeoutOrFastMode : false;
 	const timeoutMs = typeof timeoutOrFastMode === "number" ? timeoutOrFastMode : MODELS_REQUEST_TIMEOUT_MS;
 	const endpoints = resolveEndpoints(baseUrlInput);
-	const [remoteModels, costCatalog, promptCacheSources] = await Promise.all([
+	const [remoteModels, costCatalog, promptCacheSources, owners, claudeCatalog] = await Promise.all([
 		fetchCodexModels(endpoints.modelsUrl, apiKey, timeoutMs, signal),
 		pricingEnabled ? fetchModelsDevCostMap(agentDir, false, signal) : Promise.resolve(undefined),
 		pricingEnabled ? loadPromptCacheSources(agentDir, false, signal) : Promise.resolve(undefined),
+		claudeMessages
+			? fetchModelOwners(endpoints.plainModelsUrl, apiKey, timeoutMs, signal)
+			: Promise.resolve(undefined),
+		claudeMessages ? loadBuiltinClaudeFormatCatalog() : Promise.resolve(undefined),
 	]);
+	const claudeFormatIds = new Set<string>();
 	const models = remoteModels
-		.map((model) => toPiModel(model, costCatalog, effectiveFastMode, promptCacheSources))
+		.map((model) => {
+			const claudeFormat =
+				owners && claudeCatalog ? claudeFormatFor(codexModelId(model), owners, claudeCatalog) : undefined;
+			const mapped = toPiModel(model, costCatalog, effectiveFastMode, promptCacheSources, claudeFormat);
+			if (mapped && claudeFormat) claudeFormatIds.add(mapped.id);
+			return mapped;
+		})
 		.filter((model): model is PiProviderModel => model !== null);
+	// Fast mode is a Codex-format service tier; Claude-format models don't use it.
 	const fastModelIds = Array.from(
 		new Set(
 			remoteModels
 				.filter(supportsFastServiceTier)
 				.map(codexModelId)
-				.filter((modelId) => modelId.length > 0),
+				.filter((modelId) => modelId.length > 0 && !claudeFormatIds.has(modelId)),
 		),
 	);
 
@@ -1266,6 +1448,7 @@ export async function loadMappedModels(
 		inferenceBaseUrl: endpoints.inferenceBaseUrl,
 		modelsUrl: endpoints.modelsUrl,
 		...(pricingEnabled ? { fastMode: effectiveFastMode } : {}),
+		...(claudeMessages ? { claudeMessages: true } : {}),
 	};
 }
 
@@ -1371,13 +1554,15 @@ export async function resolveMappedModels(
 		forceRefresh?: boolean;
 		replaceCache?: boolean;
 		fastMode?: boolean;
+		claudeMessages?: boolean;
 		signal?: AbortSignal;
 		shouldCommit?: () => boolean;
 		staleTtlMs?: number;
 	} = {},
 ): Promise<ResolvedModelsResult> {
 	const cacheMatchesFastMode = (cache: ModelsCacheFile): boolean =>
-		options.fastMode === undefined || (cache.fastMode ?? false) === options.fastMode;
+		(options.fastMode === undefined || (cache.fastMode ?? false) === options.fastMode) &&
+		(cache.claudeMessages ?? false) === (options.claudeMessages ?? false);
 
 	const existingCache = loadModelsCache(agentDir, baseUrlInput);
 	if (!options.forceRefresh && !options.replaceCache) {
@@ -1386,7 +1571,14 @@ export async function resolveMappedModels(
 		}
 	}
 
-	const fresh = await loadMappedModels(baseUrlInput, apiKey, options.fastMode, agentDir, options.signal);
+	const fresh = await loadMappedModels(
+		baseUrlInput,
+		apiKey,
+		options.fastMode,
+		agentDir,
+		options.signal,
+		options.claudeMessages ?? false,
+	);
 	const { merged } = mergeModelsWithExistingCache(
 		options.replaceCache ? null : existingCache,
 		fresh,
