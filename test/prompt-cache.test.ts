@@ -82,6 +82,13 @@ describe("resolvePromptCache", () => {
 		}
 	});
 
+	it("matches ids with a name prefix, such as CLIProxyAPI pools, as their model", () => {
+		expect(resolvePromptCache("subs/claude-haiku-5-5", sources())).toEqual(
+			resolvePromptCache("claude-haiku-5-5", sources()),
+		);
+		expect(resolvePromptCache("cheap/gpt-6.1-sol", sources())).toEqual({ short: 1800 });
+	});
+
 	it("uses the lowest explicit lifetime for GPT-6.1", () => {
 		expect(resolvePromptCache("gpt-6.1-sol", sources())).toEqual({ short: 1800 });
 		expect(resolvePromptCache("openai/gpt-6.1-sol", sources())).toEqual({ short: 1800 });

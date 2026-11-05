@@ -762,8 +762,14 @@ function cloneCost(cost: PiProviderCost): PiProviderCost {
 	};
 }
 
+/**
+ * Lower-cased id without its vendor namespace (`anthropic/…`) or any other single leading path segment, so names
+ * CLIProxyAPI users give a model (a pool such as `subs/claude-opus-5-5`) still match catalogs as that model. Callers
+ * try the full id first, so exact entries win.
+ */
 function stripModelNamespace(modelId: string): string {
-	return modelId.trim().toLowerCase().replace(MODEL_NAMESPACE_PREFIX, "");
+	const id = modelId.trim().toLowerCase().replace(MODEL_NAMESPACE_PREFIX, "");
+	return id.replace(/^[^/]+\/(?=[^/])/, "");
 }
 
 function normalizeModelKey(modelId: string): string {
