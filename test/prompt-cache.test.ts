@@ -83,9 +83,7 @@ describe("resolvePromptCache", () => {
 	});
 
 	it("matches ids with a name prefix, such as CLIProxyAPI pools, as their model", () => {
-		expect(resolvePromptCache("subs/claude-haiku-5-5", sources())).toEqual(
-			resolvePromptCache("claude-haiku-5-5", sources()),
-		);
+		expect(resolvePromptCache("subs/claude-opus-5-5", sources())).toEqual({ short: 300 });
 		expect(resolvePromptCache("cheap/gpt-6.1-sol", sources())).toEqual({ short: 1800 });
 	});
 
