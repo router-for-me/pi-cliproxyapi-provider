@@ -258,6 +258,11 @@ By default every model, Claude included, is sent in the Codex Responses format. 
   and Anthropic writes the 1-hour tier, on API keys too. These models declare `promptCache: { short: 300, long: 3600 }`,
   so pi plans warming accordingly (with `long`, the first refresh would fall past pi's 30-minute idle limit, so idle
   sessions aren't warmed at all). One-hour cache writes cost 2× the input price instead of 1.25×.
+- **Limits come from CLIProxyAPI:** the context window and output limit are what CLIProxyAPI reports, as for every
+  other model. Unlike the Codex format, Claude's format sends the output limit (`max_tokens`) on every request. CLIProxyAPI
+  versions without router-for-me/CLIProxyAPI#7278 report Claude models configured under an API key (aliases) with a
+  500k window and no output limit, so pi falls back to 16,384 output tokens; update CLIProxyAPI to get the real values.
+  (`max-context-length` on the model in CLIProxyAPI's config fixes the window only.)
 - **Not available for these models:** Fast mode (a Codex service tier) and the Codex WebSocket transport. Thinking,
   tools, images, warming, the no-cache guard and auto-compaction work as before.
 - Toggling the option refreshes the model list (the cache records it). The first request of an ongoing session after
