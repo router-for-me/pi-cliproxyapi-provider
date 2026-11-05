@@ -74,6 +74,11 @@ describe("claudeFormatFor", () => {
 		expect(claudeFormatFor("anthropic/claude-opus-5.5", owners, CATALOG)).toBeDefined();
 	});
 
+	it("selects prefixed ids such as pool names (subs/claude-opus-5-5)", () => {
+		const prefixed = new Map([["subs/claude-opus-5-5", "anthropic"]]);
+		expect(claudeFormatFor("subs/claude-opus-5-5", prefixed, CATALOG)?.reasoning).toBe(true);
+	});
+
 	it("keeps other owners and unknown Claude models on the Codex format", () => {
 		expect(claudeFormatFor("gpt-6.1-sol", owners, CATALOG)).toBeUndefined();
 		expect(claudeFormatFor("claude-unknown-9", owners, CATALOG)).toBeUndefined();
