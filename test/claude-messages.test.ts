@@ -104,6 +104,11 @@ describe("toPiModel with the Claude format", () => {
 		expect(mapped?.thinkingLevelMap?.max).toBe("max");
 	});
 
+	it("uses a cache lifetime CLIProxyAPI reports for the route", () => {
+		const mapped = toPiModel({ ...model, prompt_cache_ttl_seconds: 3600 }, undefined, false, undefined, entry);
+		expect(mapped?.promptCache).toEqual({ short: 3600, long: 3600 });
+	});
+
 	it("stays on the Codex format without an entry", () => {
 		const mapped = toPiModel(model);
 		expect(mapped?.api).toBeUndefined();
