@@ -80,6 +80,8 @@ export interface CodexClientModel {
 	max_tokens?: number;
 	max_output_tokens?: number;
 	max_completion_tokens?: number;
+	/** Prompt-cache lifetime of this route, reported by CLIProxyAPI plugins such as the pools plugin. */
+	prompt_cache_ttl_seconds?: number;
 	input_modalities?: string[];
 	supported_reasoning_levels?: CodexReasoningLevel[] | string[];
 	supports_reasoning_effort_updates?: boolean;
@@ -575,7 +577,10 @@ export function toPiModel(
 			: undefined) ??
 		DEFAULT_MAX_TOKENS;
 
-	const promptCache = promptCacheSources ? resolvePromptCache(id, promptCacheSources) : undefined;
+	const promptCache = withReportedCacheLifetime(
+		promptCacheSources ? resolvePromptCache(id, promptCacheSources) : undefined,
+		model.prompt_cache_ttl_seconds,
+	);
 
 	return {
 		id,
@@ -1065,6 +1070,20 @@ export function findPromptCacheShort(modelId: string, catalog: PromptCacheCatalo
 }
 
 /** `{short}` = the shortest lifetime known for this model id, or undefined when no source knows one. */
+/**
+ * A lifetime CLIProxyAPI reports for the route (e.g. a pool whose members all keep a 1-hour cache) describes what
+ * this model id really gets, so it replaces the catalog's default tier. The catalog's long tier stays.
+ */
+export function withReportedCacheLifetime(
+	promptCache: PiProviderModelPromptCache | undefined,
+	reportedSeconds: unknown,
+): PiProviderModelPromptCache | undefined {
+	if (typeof reportedSeconds !== "number" || !Number.isFinite(reportedSeconds) || reportedSeconds <= 0) {
+		return promptCache;
+	}
+	return { ...promptCache, short: Math.round(reportedSeconds) };
+}
+
 export function resolvePromptCache(
 	modelId: string,
 	sources: PromptCacheSources,

@@ -14,6 +14,7 @@ import {
 	parseCacheTtlSeconds,
 	resolvePromptCache,
 	toPiModel,
+	withReportedCacheLifetime,
 } from "../extensions/lib.ts";
 
 // Shapes copied from models.dev experimental v2 (capabilities.cache).
@@ -130,6 +131,26 @@ describe("toPiModel promptCache", () => {
 	it("omits promptCache when no lifetime is known or no sources are given", () => {
 		expect(toPiModel(model("deepseek-v4-pro"), undefined, false, sources())).not.toHaveProperty("promptCache");
 		expect(toPiModel(model("claude-opus-5-5"))).not.toHaveProperty("promptCache");
+	});
+});
+
+describe("reported cache lifetime", () => {
+	it("replaces the catalog's default tier and keeps its long tier", () => {
+		expect(withReportedCacheLifetime({ short: 300, long: 3600 }, 3600)).toEqual({ short: 3600, long: 3600 });
+		expect(withReportedCacheLifetime(undefined, 1800)).toEqual({ short: 1800 });
+	});
+
+	it("ignores missing or invalid values", () => {
+		expect(withReportedCacheLifetime({ short: 300 }, undefined)).toEqual({ short: 300 });
+		expect(withReportedCacheLifetime({ short: 300 }, 0)).toEqual({ short: 300 });
+		expect(withReportedCacheLifetime(undefined, "3600")).toBeUndefined();
+	});
+
+	it("uses prompt_cache_ttl_seconds from CLIProxyAPI's model list", () => {
+		const model: CodexClientModel = { slug: "subs/claude-opus-5-5", prompt_cache_ttl_seconds: 3600 };
+		expect(toPiModel(model)?.promptCache).toEqual({ short: 3600 });
+		expect(toPiModel(model, undefined, false, sources())?.promptCache).toEqual({ short: 3600 });
+		expect(toPiModel({ slug: "claude-opus-5-5" }, undefined, false, sources())?.promptCache).toEqual({ short: 300 });
 	});
 });
 
