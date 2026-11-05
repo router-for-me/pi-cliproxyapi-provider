@@ -29,6 +29,7 @@ export const MODELS_REQUEST_TIMEOUT_MS = 60_000;
 /** Keep login credentials effectively permanent; reconfigure via /login. */
 export const CREDENTIAL_TTL_MS = 100 * 365 * 24 * 60 * 60 * 1000;
 export const MODELS_DEV_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+export const MODELS_DEV_V2_URL = "https://models.dev/experimental/v2.0/api.json";
 
 export const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
 export const DEFAULT_MAX_TOKENS = 16384;
@@ -110,6 +111,12 @@ export interface PiProviderCost {
 	tiers?: PiProviderCostTier[];
 }
 
+/** Prompt cache lifetimes in seconds per retention tier (pi `Model.promptCache`). */
+export interface PiProviderModelPromptCache {
+	short?: number;
+	long?: number;
+}
+
 export interface PiProviderModel {
 	id: string;
 	name: string;
@@ -120,6 +127,7 @@ export interface PiProviderModel {
 	maxTokens: number;
 	thinkingLevelMap?: ThinkingLevelMap;
 	compat?: PiProviderModelCompat;
+	promptCache?: PiProviderModelPromptCache;
 	stale?: boolean;
 	lastSeenAt?: number;
 	staleSince?: number;
@@ -528,6 +536,7 @@ export function toPiModel(
 	model: CodexClientModel,
 	costCatalog?: ModelsDevCostCatalog,
 	fastMode = false,
+	promptCacheSources?: PromptCacheSources,
 ): PiProviderModel | null {
 	const id = codexModelId(model);
 	if (!id) {
@@ -566,6 +575,8 @@ export function toPiModel(
 			: undefined) ??
 		DEFAULT_MAX_TOKENS;
 
+	const promptCache = promptCacheSources ? resolvePromptCache(id, promptCacheSources) : undefined;
+
 	return {
 		id,
 		name: (model.display_name ?? model.name ?? id).trim() || id,
@@ -576,6 +587,7 @@ export function toPiModel(
 		maxTokens,
 		thinkingLevelMap: buildThinkingLevelMap(efforts),
 		...(hasReasoning && supportsReasoningEffortUpdates(model) ? { compat: { supportsMidConvoEffort: true } } : {}),
+		...(promptCache ? { promptCache } : {}),
 	};
 }
 
@@ -765,7 +777,11 @@ function preferredProvidersForModel(modelId: string): string[] {
 	return uniqueStrings([namespace ?? "", ...familyProviders]);
 }
 
-function addCatalogEntry(catalog: Map<string, ModelsDevCostEntry[]>, key: string, entry: ModelsDevCostEntry): void {
+function addCatalogEntry<T extends { providerId: string; modelId: string }>(
+	catalog: Map<string, T[]>,
+	key: string,
+	entry: T,
+): void {
 	if (!key) return;
 	const entries = catalog.get(key) ?? [];
 	if (!entries.some((candidate) => candidate.providerId === entry.providerId && candidate.modelId === entry.modelId)) {
@@ -927,6 +943,265 @@ export function matchModelCost(modelId: string, costCatalog: ModelsDevCostCatalo
 	return cloneCost(isFastMode && entry.fast ? entry.fast : entry.standard);
 }
 
+// ---------------------------------------------------------------------------
+// Prompt cache lifetimes
+//
+// pi only keeps a prompt cache warm when the model declares `promptCache`.
+// Sources: pi's built-in catalog and models.dev v2 (`capabilities.cache.explicit.ttl`).
+// `short` is the shortest lifetime any source knows: declaring one that is too
+// short only adds cheap warm-ups, one that is too long makes pi warm too late.
+// Models without explicit-cache data get no lifetime, so pi does not warm them.
+// ---------------------------------------------------------------------------
+
+export interface PromptCacheEntry {
+	providerId: string;
+	modelId: string;
+	/** Shortest explicit lifetime in seconds; undefined when the entry has cache data but no explicit lifetime. */
+	short?: number;
+}
+
+export interface PromptCacheCatalog {
+	exact: Map<string, PromptCacheEntry[]>;
+	normalized: Map<string, PromptCacheEntry[]>;
+}
+
+export interface PromptCacheSources {
+	builtin: PromptCacheCatalog;
+	modelsDev: PromptCacheCatalog;
+}
+
+const TTL_UNIT_SECONDS: Record<string, number> = { s: 1, m: 60, h: 3600, d: 86400 };
+
+/** Parse a lifetime such as "5m", "1h", "300s" or 300 into seconds. */
+export function parseCacheTtlSeconds(value: unknown): number | undefined {
+	if (typeof value === "number") return Number.isFinite(value) && value > 0 ? Math.round(value) : undefined;
+	if (typeof value !== "string") return undefined;
+	const match = value
+		.trim()
+		.toLowerCase()
+		.match(/^(\d+(?:\.\d+)?)\s*([smhd]?)$/);
+	if (!match) return undefined;
+	const seconds = Number(match[1]) * TTL_UNIT_SECONDS[match[2] || "s"];
+	return Number.isFinite(seconds) && seconds > 0 ? Math.round(seconds) : undefined;
+}
+
+export function emptyPromptCacheCatalog(): PromptCacheCatalog {
+	return { exact: new Map(), normalized: new Map() };
+}
+
+function addPromptCacheEntry(catalog: PromptCacheCatalog, entry: PromptCacheEntry): void {
+	const rawId = entry.modelId.trim().toLowerCase();
+	for (const key of uniqueStrings([rawId, stripModelNamespace(rawId)])) {
+		addCatalogEntry(catalog.exact, key, entry);
+	}
+	addCatalogEntry(catalog.normalized, normalizeModelKey(rawId), entry);
+}
+
+/** models.dev v2 → one entry per model that has cache data. Unknown shapes yield an empty catalog. */
+export function buildPromptCacheCatalogFromModelsDevV2(providers: unknown): PromptCacheCatalog {
+	const catalog = emptyPromptCacheCatalog();
+	const providerMap = asRecord(providers);
+	if (!providerMap) return catalog;
+	for (const [providerId, providerValue] of Object.entries(providerMap)) {
+		const models = asRecord(asRecord(providerValue)?.models);
+		if (!models) continue;
+		for (const [modelId, modelValue] of Object.entries(models)) {
+			const cache = asRecord(asRecord(asRecord(modelValue)?.capabilities)?.cache);
+			if (!cache) continue;
+			const explicit = asRecord(cache.explicit);
+			const ttls = (Array.isArray(explicit?.ttl) ? explicit.ttl : [])
+				.map(parseCacheTtlSeconds)
+				.filter((seconds): seconds is number => seconds !== undefined);
+			addPromptCacheEntry(catalog, {
+				providerId,
+				modelId,
+				...(ttls.length > 0 ? { short: Math.min(...ttls) } : {}),
+			});
+		}
+	}
+	return catalog;
+}
+
+/** pi's built-in models (`{provider, id, promptCache}`) → catalog of their declared short lifetimes. */
+export function buildPromptCacheCatalogFromModels(
+	models: ReadonlyArray<{ provider?: string; id?: string; promptCache?: PiProviderModelPromptCache }>,
+): PromptCacheCatalog {
+	const catalog = emptyPromptCacheCatalog();
+	for (const model of models) {
+		const short = parseCacheTtlSeconds(model.promptCache?.short);
+		if (!model.id || !model.provider || short === undefined) continue;
+		addPromptCacheEntry(catalog, { providerId: model.provider, modelId: model.id, short });
+	}
+	return catalog;
+}
+
+function selectPromptCacheShort(entries: PromptCacheEntry[], modelId: string): number | undefined {
+	if (entries.length === 0) return undefined;
+	for (const providerId of preferredProvidersForModel(modelId)) {
+		const match = entries.find((entry) => entry.providerId === providerId);
+		if (match) return match.short;
+	}
+	// No preferred host: only trust a lifetime every listed host agrees has one.
+	const shorts = entries.map((entry) => entry.short);
+	if (shorts.some((short) => short === undefined)) return undefined;
+	return Math.min(...(shorts as number[]));
+}
+
+function findPromptCacheEntries(modelId: string, catalog: PromptCacheCatalog): PromptCacheEntry[] {
+	const rawId = modelId.trim().toLowerCase();
+	for (const lookupId of uniqueStrings([rawId, ...(MODEL_PRICE_ALIASES[rawId] ?? [])])) {
+		for (const key of uniqueStrings([lookupId, stripModelNamespace(lookupId)])) {
+			const entries = catalog.exact.get(key);
+			if (entries?.length) return entries;
+		}
+		const entries = catalog.normalized.get(normalizeModelKey(lookupId));
+		if (entries?.length) return entries;
+	}
+	return [];
+}
+
+export function findPromptCacheShort(modelId: string, catalog: PromptCacheCatalog): number | undefined {
+	return selectPromptCacheShort(findPromptCacheEntries(modelId, catalog), modelId);
+}
+
+/** `{short}` = the shortest lifetime known for this model id, or undefined when no source knows one. */
+export function resolvePromptCache(
+	modelId: string,
+	sources: PromptCacheSources,
+): PiProviderModelPromptCache | undefined {
+	const known = [
+		findPromptCacheShort(modelId, sources.builtin),
+		findPromptCacheShort(modelId, sources.modelsDev),
+	].filter((seconds): seconds is number => seconds !== undefined);
+	return known.length > 0 ? { short: Math.min(...known) } : undefined;
+}
+
+interface PromptCacheFileEntry {
+	p: string;
+	m: string;
+	s?: number;
+}
+
+interface PromptCacheFile {
+	timestamp: number;
+	entries: PromptCacheFileEntry[];
+}
+
+function getPromptCacheFilePath(agentDir?: string): string {
+	if (agentDir?.trim()) {
+		return join(agentDir, "tmp", "models-dev-prompt-cache.json");
+	}
+	return join(tmpdir(), "pi-cliproxyapi-models-dev-prompt-cache.json");
+}
+
+function catalogEntries(catalog: PromptCacheCatalog): PromptCacheEntry[] {
+	const seen = new Set<PromptCacheEntry>();
+	for (const entries of catalog.normalized.values()) for (const entry of entries) seen.add(entry);
+	return [...seen];
+}
+
+function readPromptCacheFile(path: string): PromptCacheFile | null {
+	try {
+		const parsed = asRecord(JSON.parse(readFileSync(path, "utf8")));
+		if (!parsed || typeof parsed.timestamp !== "number" || !Array.isArray(parsed.entries)) return null;
+		return { timestamp: parsed.timestamp, entries: parsed.entries as PromptCacheFileEntry[] };
+	} catch {
+		return null;
+	}
+}
+
+function catalogFromFile(file: PromptCacheFile): PromptCacheCatalog {
+	const catalog = emptyPromptCacheCatalog();
+	for (const entry of file.entries) {
+		if (typeof entry?.p !== "string" || typeof entry?.m !== "string") continue;
+		const short = parseCacheTtlSeconds(entry.s);
+		addPromptCacheEntry(catalog, { providerId: entry.p, modelId: entry.m, ...(short ? { short } : {}) });
+	}
+	return catalog;
+}
+
+function writePromptCacheFile(path: string, catalog: PromptCacheCatalog): void {
+	try {
+		mkdirSync(dirname(path), { recursive: true });
+		const entries: PromptCacheFileEntry[] = catalogEntries(catalog).map((entry) => ({
+			p: entry.providerId,
+			m: entry.modelId,
+			...(entry.short ? { s: entry.short } : {}),
+		}));
+		writeFileSync(path, JSON.stringify({ timestamp: Date.now(), entries } satisfies PromptCacheFile), "utf8");
+	} catch {
+		// Ignore write failure (e.g. read-only filesystem)
+	}
+}
+
+/** models.dev v2 cache lifetimes, cached for 24 h; a stale copy is used when models.dev is unreachable. */
+export async function fetchModelsDevPromptCacheCatalog(
+	agentDir?: string,
+	forceRefresh = false,
+	signal?: AbortSignal,
+): Promise<PromptCacheCatalog> {
+	const path = getPromptCacheFilePath(agentDir);
+	const cached = readPromptCacheFile(path);
+	if (!forceRefresh && cached && Date.now() - cached.timestamp < MODELS_DEV_CACHE_TTL_MS) {
+		return catalogFromFile(cached);
+	}
+
+	const controller = new AbortController();
+	const timeoutId = setTimeout(() => controller.abort(), 10_000);
+	const requestSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+	try {
+		const response = await fetch(MODELS_DEV_V2_URL, { signal: requestSignal });
+		if (response.ok) {
+			const catalog = buildPromptCacheCatalogFromModelsDevV2(await response.json());
+			if (catalog.normalized.size > 0) {
+				writePromptCacheFile(path, catalog);
+				return catalog;
+			}
+		}
+	} catch {
+		// Retain stale cache if network/JSON fails
+	} finally {
+		clearTimeout(timeoutId);
+	}
+	return cached ? catalogFromFile(cached) : emptyPromptCacheCatalog();
+}
+
+/** pi's built-in catalog via the pi-ai peer; empty on pi versions without it. */
+export async function loadBuiltinPromptCacheCatalog(): Promise<PromptCacheCatalog> {
+	try {
+		const builtins = (await import("@earendil-works/pi-ai/providers/all")) as {
+			getBuiltinProviders?: () => string[];
+			getBuiltinModels?: (
+				provider: string,
+			) => Array<{ provider?: string; id?: string; promptCache?: PiProviderModelPromptCache }>;
+		};
+		if (typeof builtins.getBuiltinProviders !== "function" || typeof builtins.getBuiltinModels !== "function") {
+			return emptyPromptCacheCatalog();
+		}
+		const models = builtins.getBuiltinProviders().flatMap((provider) =>
+			(builtins.getBuiltinModels?.(provider) ?? []).map((model) => ({
+				...model,
+				provider: model.provider ?? provider,
+			})),
+		);
+		return buildPromptCacheCatalogFromModels(models);
+	} catch {
+		return emptyPromptCacheCatalog();
+	}
+}
+
+export async function loadPromptCacheSources(
+	agentDir?: string,
+	forceRefresh = false,
+	signal?: AbortSignal,
+): Promise<PromptCacheSources> {
+	const [builtin, modelsDev] = await Promise.all([
+		loadBuiltinPromptCacheCatalog(),
+		fetchModelsDevPromptCacheCatalog(agentDir, forceRefresh, signal),
+	]);
+	return { builtin, modelsDev };
+}
+
 export async function loadMappedModels(
 	baseUrlInput: string,
 	apiKey: string,
@@ -938,12 +1213,13 @@ export async function loadMappedModels(
 	const effectiveFastMode = typeof timeoutOrFastMode === "boolean" ? timeoutOrFastMode : false;
 	const timeoutMs = typeof timeoutOrFastMode === "number" ? timeoutOrFastMode : MODELS_REQUEST_TIMEOUT_MS;
 	const endpoints = resolveEndpoints(baseUrlInput);
-	const [remoteModels, costCatalog] = await Promise.all([
+	const [remoteModels, costCatalog, promptCacheSources] = await Promise.all([
 		fetchCodexModels(endpoints.modelsUrl, apiKey, timeoutMs, signal),
 		pricingEnabled ? fetchModelsDevCostMap(agentDir, false, signal) : Promise.resolve(undefined),
+		pricingEnabled ? loadPromptCacheSources(agentDir, false, signal) : Promise.resolve(undefined),
 	]);
 	const models = remoteModels
-		.map((model) => toPiModel(model, costCatalog, effectiveFastMode))
+		.map((model) => toPiModel(model, costCatalog, effectiveFastMode, promptCacheSources))
 		.filter((model): model is PiProviderModel => model !== null);
 	const fastModelIds = Array.from(
 		new Set(

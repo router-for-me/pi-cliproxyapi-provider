@@ -28,6 +28,7 @@ import type {
 } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { ProactiveCompactionController } from "./auto-compact.ts";
+import { registerCacheWarmingGuard } from "./cache-guard.ts";
 import {
 	applyFastPayloadHook,
 	CLIPROXYAPI_CODEX_API,
@@ -954,6 +955,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		onRefreshOutcome: handleRefreshOutcome,
 	});
 	registerTransientNetworkErrorRetry(pi, identity.providerId);
+	registerCacheWarmingGuard(pi, identity.providerId);
 
 	let activeContext: ExtensionContext | undefined;
 	let latestStaleModelIds: string[] = [];

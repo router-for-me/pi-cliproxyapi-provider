@@ -262,7 +262,7 @@ describe("resolveMappedModels cache behavior", () => {
 
 		try {
 			const result = await resolveMappedModels(agentDir, "http://127.0.0.1:8317", "key", { fastMode: true });
-			expect(fetchMock).toHaveBeenCalledTimes(2);
+			expect(fetchMock).toHaveBeenCalledTimes(3);
 			expect(result.fromCache).toBe(false);
 			expect(result.loaded.models[0]?.id).toBe("remote-fast");
 			expect(loadModelsCache(agentDir, "http://127.0.0.1:8317")?.fastMode).toBe(true);
@@ -503,7 +503,7 @@ describe("provider startup cache behavior", () => {
 			try {
 				const startup = providerExtension(pi);
 				await waitForAsyncRefresh();
-				expect(fetchMock).toHaveBeenCalledTimes(2);
+				expect(fetchMock).toHaveBeenCalledTimes(3);
 				releaseRemote(
 					new Response(JSON.stringify({ models: [createCodexModel("startup-remote")] }), { status: 200 }),
 				);
@@ -537,7 +537,7 @@ describe("provider startup cache behavior", () => {
 
 			try {
 				await expect(providerExtension(pi)).resolves.toBeUndefined();
-				expect(fetchMock).toHaveBeenCalledTimes(2);
+				expect(fetchMock).toHaveBeenCalledTimes(3);
 				expect(commands.has("cliproxyapi-refresh")).toBe(true);
 
 				const initialCallsWithModels = (
@@ -629,7 +629,7 @@ describe("provider startup cache behavior", () => {
 			try {
 				await expect(providerExtension(pi)).resolves.toBeUndefined();
 				await waitForAsyncRefresh();
-				expect(fetchMock).toHaveBeenCalledTimes(2);
+				expect(fetchMock).toHaveBeenCalledTimes(3);
 				expect(warnMock).not.toHaveBeenCalledWith(expect.stringContaining("failed to refresh cached models"));
 
 				const callsWithModels = (
@@ -1195,7 +1195,7 @@ describe("/cliproxyapi-refresh command", () => {
 
 				await refresh.handler("", ctx);
 
-				expect(fetchMock).toHaveBeenCalledTimes(4);
+				expect(fetchMock).toHaveBeenCalledTimes(6);
 				expect(notify).toHaveBeenCalledWith(expect.stringContaining("Refreshed 1 CLIProxyAPI models"), "info");
 
 				const diskCache = loadModelsCache(agentDir, "http://127.0.0.1:8317");
