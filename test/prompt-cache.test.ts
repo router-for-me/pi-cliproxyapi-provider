@@ -130,7 +130,16 @@ describe("toPiModel promptCache", () => {
 	const model = (id: string): CodexClientModel => ({ slug: id, display_name: id });
 
 	it("adds promptCache when a lifetime is known", () => {
-		expect(toPiModel(model("claude-opus-5-5"), undefined, false, sources())?.promptCache).toEqual({ short: 300 });
+		expect(toPiModel(model("claude-opus-5-5"), undefined, false, sources())?.promptCache).toEqual({
+			short: 300,
+			long: 300,
+		});
+	});
+
+	it("declares the Codex-format lifetime for both tiers, so PI_CACHE_RETENTION=long keeps warming", () => {
+		// pi plans warming from promptCache[retention]; a missing long tier would mean "unknown, don't warm".
+		const mapped = toPiModel({ slug: "gpt-6.1-sol", prompt_cache_ttl_seconds: 1800 });
+		expect(mapped?.promptCache).toEqual({ short: 1800, long: 1800 });
 	});
 
 	it("omits promptCache when no lifetime is known or no sources are given", () => {
@@ -153,9 +162,12 @@ describe("reported cache lifetime", () => {
 
 	it("uses prompt_cache_ttl_seconds from CLIProxyAPI's model list", () => {
 		const model: CodexClientModel = { slug: "subs/claude-opus-5-5", prompt_cache_ttl_seconds: 3600 };
-		expect(toPiModel(model)?.promptCache).toEqual({ short: 3600 });
-		expect(toPiModel(model, undefined, false, sources())?.promptCache).toEqual({ short: 3600 });
-		expect(toPiModel({ slug: "claude-opus-5-5" }, undefined, false, sources())?.promptCache).toEqual({ short: 300 });
+		expect(toPiModel(model)?.promptCache).toEqual({ short: 3600, long: 3600 });
+		expect(toPiModel(model, undefined, false, sources())?.promptCache).toEqual({ short: 3600, long: 3600 });
+		expect(toPiModel({ slug: "claude-opus-5-5" }, undefined, false, sources())?.promptCache).toEqual({
+			short: 300,
+			long: 300,
+		});
 	});
 });
 
