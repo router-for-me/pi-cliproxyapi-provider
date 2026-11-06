@@ -7,9 +7,11 @@ import {
 	buildClaudeFormatCatalog,
 	type CodexClientModel,
 	claudeFormatFor,
+	claudeMessagesMode,
 	fetchModelOwners,
 	loadBuiltinClaudeFormatCatalog,
 	loadMappedModels,
+	reportedMaxTokens,
 	resolveClaudeMessagesDefault,
 	toPiModel,
 } from "../extensions/lib.ts";
@@ -46,18 +48,43 @@ afterEach(() => {
 });
 
 describe("resolveClaudeMessagesDefault", () => {
-	it("defaults to false and reads cliproxyapi.json", () => {
-		expect(resolveClaudeMessagesDefault(agentDir())).toBe(false);
-		expect(resolveClaudeMessagesDefault(agentDir({ claudeMessages: true }))).toBe(true);
+	it("defaults to auto and reads cliproxyapi.json", () => {
+		expect(resolveClaudeMessagesDefault(agentDir())).toBe("auto");
+		expect(resolveClaudeMessagesDefault(agentDir({ claudeMessages: "auto" }))).toBe("auto");
+		expect(resolveClaudeMessagesDefault(agentDir({ claudeMessages: true }))).toBe("on");
+		expect(resolveClaudeMessagesDefault(agentDir({ claudeMessages: false }))).toBe("off");
 	});
 
 	it("lets the environment win and rejects bad values", () => {
 		process.env.CLIPROXYAPI_CLAUDE_MESSAGES = "off";
-		expect(resolveClaudeMessagesDefault(agentDir({ claudeMessages: true }))).toBe(false);
+		expect(resolveClaudeMessagesDefault(agentDir({ claudeMessages: true }))).toBe("off");
+		process.env.CLIPROXYAPI_CLAUDE_MESSAGES = "1";
+		expect(resolveClaudeMessagesDefault(agentDir({ claudeMessages: false }))).toBe("on");
+		process.env.CLIPROXYAPI_CLAUDE_MESSAGES = "Auto";
+		expect(resolveClaudeMessagesDefault(agentDir({ claudeMessages: false }))).toBe("auto");
 		process.env.CLIPROXYAPI_CLAUDE_MESSAGES = "maybe";
 		expect(() => resolveClaudeMessagesDefault(agentDir())).toThrow(/CLIPROXYAPI_CLAUDE_MESSAGES/);
 		delete process.env.CLIPROXYAPI_CLAUDE_MESSAGES;
 		expect(() => resolveClaudeMessagesDefault(agentDir({ claudeMessages: "yes" }))).toThrow(/claudeMessages/);
+	});
+});
+
+describe("claudeMessagesMode", () => {
+	it("reads modes and the booleans older caches stored", () => {
+		expect(claudeMessagesMode(true)).toBe("on");
+		expect(claudeMessagesMode("on")).toBe("on");
+		expect(claudeMessagesMode("auto")).toBe("auto");
+		expect(claudeMessagesMode(false)).toBe("off");
+		expect(claudeMessagesMode(undefined)).toBe("off");
+	});
+});
+
+describe("reportedMaxTokens", () => {
+	it("takes the first positive output limit CLIProxyAPI reports", () => {
+		expect(reportedMaxTokens({ slug: "m", max_tokens: 64000 })).toBe(64000);
+		expect(reportedMaxTokens({ slug: "m", max_output_tokens: 32000 })).toBe(32000);
+		expect(reportedMaxTokens({ slug: "m", max_tokens: 0, max_completion_tokens: 8000 })).toBe(8000);
+		expect(reportedMaxTokens({ slug: "m" })).toBeUndefined();
 	});
 });
 
@@ -137,14 +164,19 @@ describe("fetchModelOwners", () => {
 });
 
 describe("loadMappedModels with claudeMessages", () => {
-	function mockCpa() {
+	function mockCpa(claudeMaxTokens?: number) {
 		return vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
 			const url = String(input);
 			if (url.includes("client_version")) {
 				return new Response(
 					JSON.stringify({
 						models: [
-							{ slug: "claude-opus-5-5", supported_reasoning_levels: ["high"], service_tiers: ["priority"] },
+							{
+								slug: "claude-opus-5-5",
+								supported_reasoning_levels: ["high"],
+								service_tiers: ["priority"],
+								...(claudeMaxTokens ? { max_tokens: claudeMaxTokens } : {}),
+							},
 							{ slug: "gpt-6.1-sol", supported_reasoning_levels: ["high"], service_tiers: ["priority"] },
 						],
 					}),
@@ -166,18 +198,41 @@ describe("loadMappedModels with claudeMessages", () => {
 
 	it("switches Claude models only, drops them from Fast, and marks the result", async () => {
 		mockCpa();
-		const loaded = await loadMappedModels("http://127.0.0.1:8317", "key", false, agentDir(), undefined, true);
+		const loaded = await loadMappedModels("http://127.0.0.1:8317", "key", false, agentDir(), undefined, "on");
 		const claude = loaded.models.find((m) => m.id === "claude-opus-5-5");
 		const gpt = loaded.models.find((m) => m.id === "gpt-6.1-sol");
 		expect(claude?.api).toBe(ANTHROPIC_MESSAGES_API);
 		expect(claude?.promptCache?.long).toBe(3600);
 		expect(gpt?.api).toBeUndefined();
 		expect(loaded.fastModelIds).toEqual(["gpt-6.1-sol"]);
-		expect(loaded.claudeMessages).toBe(true);
+		expect(loaded.claudeMessages).toBe("on");
+	});
+
+	it("still accepts true from older callers", async () => {
+		mockCpa();
+		const loaded = await loadMappedModels("http://127.0.0.1:8317", "key", false, agentDir(), undefined, true);
+		expect(loaded.models.find((m) => m.id === "claude-opus-5-5")?.api).toBe(ANTHROPIC_MESSAGES_API);
+		expect(loaded.claudeMessages).toBe("on");
+	});
+
+	it("in auto, switches a Claude model only when CLIProxyAPI reports its output limit", async () => {
+		mockCpa(64000);
+		const withLimit = await loadMappedModels("http://127.0.0.1:8317", "key", false, agentDir(), undefined, "auto");
+		expect(withLimit.models.find((m) => m.id === "claude-opus-5-5")).toMatchObject({
+			api: ANTHROPIC_MESSAGES_API,
+			maxTokens: 64000,
+		});
+		expect(withLimit.claudeMessages).toBe("auto");
+		vi.restoreAllMocks();
+
+		mockCpa();
+		const withoutLimit = await loadMappedModels("http://127.0.0.1:8317", "key", false, agentDir(), undefined, "auto");
+		expect(withoutLimit.models.find((m) => m.id === "claude-opus-5-5")?.api).toBeUndefined();
+		expect(withoutLimit.fastModelIds).toContain("claude-opus-5-5");
 	});
 
 	it("doesn't fetch owners or change anything when off", async () => {
-		const fetchMock = mockCpa();
+		const fetchMock = mockCpa(64000);
 		const loaded = await loadMappedModels("http://127.0.0.1:8317", "key", false, agentDir());
 		expect(loaded.models.every((m) => m.api === undefined)).toBe(true);
 		expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/v1/models"))).toBe(false);

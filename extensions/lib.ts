@@ -49,7 +49,24 @@ export interface CliproxyConfigFile {
 	providerName?: string;
 	fast?: boolean;
 	pause?: boolean;
-	claudeMessages?: boolean;
+	claudeMessages?: boolean | "auto";
+}
+
+/**
+ * When Claude models use Anthropic's Messages format instead of the Codex Responses format.
+ * - "auto" (default): when CLIProxyAPI lists the model as Anthropic's, pi's catalog knows it, and CLIProxyAPI
+ *   reports its output limit (the Messages format always sends max_tokens, so without a reported limit replies
+ *   would be capped at pi's 16,384 default);
+ * - "on": whenever CLIProxyAPI lists the model as Anthropic's and pi's catalog knows it;
+ * - "off": never.
+ */
+export type ClaudeMessagesMode = "auto" | "on" | "off";
+
+/** Normalizes a stored or passed Claude Messages setting; old caches and callers use booleans. */
+export function claudeMessagesMode(value: unknown): ClaudeMessagesMode {
+	if (value === true || value === "on") return "on";
+	if (value === "auto") return "auto";
+	return "off";
 }
 
 export interface ResolvedIdentity {
@@ -149,7 +166,7 @@ export interface MappedModels {
 	inferenceBaseUrl: string;
 	modelsUrl: string;
 	fastMode?: boolean;
-	claudeMessages?: boolean;
+	claudeMessages?: ClaudeMessagesMode | boolean;
 }
 
 export interface ModelsCacheFile extends MappedModels {
@@ -443,24 +460,25 @@ export function resolveFastDefault(agentDir: string): boolean {
 	return file.fast;
 }
 
-/** Resolve the Claude Messages preference from env, then cliproxyapi.json, then false. */
-export function resolveClaudeMessagesDefault(agentDir: string): boolean {
+/** Resolve the Claude Messages mode from env, then cliproxyapi.json, then "auto". */
+export function resolveClaudeMessagesDefault(agentDir: string): ClaudeMessagesMode {
 	const envValue = firstNonEmpty(process.env.CLIPROXYAPI_CLAUDE_MESSAGES);
 	if (envValue !== undefined) {
+		if (envValue.trim().toLowerCase() === "auto") return "auto";
 		const parsed = parseBooleanSetting(envValue);
 		if (parsed === undefined) {
-			throw new Error("CLIPROXYAPI_CLAUDE_MESSAGES must be one of: true, false, 1, 0, yes, no, on, off");
+			throw new Error("CLIPROXYAPI_CLAUDE_MESSAGES must be one of: auto, true, false, 1, 0, yes, no, on, off");
 		}
-		return parsed;
+		return parsed ? "on" : "off";
 	}
 	const file = loadConfigFile(agentDir);
-	if (file.claudeMessages === undefined) {
-		return false;
+	if (file.claudeMessages === undefined || file.claudeMessages === "auto") {
+		return "auto";
 	}
 	if (typeof file.claudeMessages !== "boolean") {
-		throw new Error(`${CONFIG_FILE_NAME} field "claudeMessages" must be a boolean`);
+		throw new Error(`${CONFIG_FILE_NAME} field "claudeMessages" must be true, false or "auto"`);
 	}
-	return file.claudeMessages;
+	return file.claudeMessages ? "on" : "off";
 }
 
 /** Resolve the request pause preference from cliproxyapi.json, defaulting to false. */
@@ -597,21 +615,7 @@ export function toPiModel(
 		? matchModelCost(id, costCatalog, fastMode && supportsFastServiceTier(model))
 		: { ...ZERO_COST };
 
-	const maxTokens =
-		(typeof model.max_tokens === "number" && Number.isFinite(model.max_tokens) && model.max_tokens > 0
-			? model.max_tokens
-			: undefined) ??
-		(typeof model.max_output_tokens === "number" &&
-		Number.isFinite(model.max_output_tokens) &&
-		model.max_output_tokens > 0
-			? model.max_output_tokens
-			: undefined) ??
-		(typeof model.max_completion_tokens === "number" &&
-		Number.isFinite(model.max_completion_tokens) &&
-		model.max_completion_tokens > 0
-			? model.max_completion_tokens
-			: undefined) ??
-		DEFAULT_MAX_TOKENS;
+	const maxTokens = reportedMaxTokens(model) ?? DEFAULT_MAX_TOKENS;
 
 	const resolvedCache = withReportedCacheLifetime(
 		promptCacheSources ? resolvePromptCache(id, promptCacheSources) : undefined,
@@ -1400,14 +1404,24 @@ export function claudeFormatFor(
 	return findClaudeFormatEntry(modelId, catalog);
 }
 
+/** The output limit CLIProxyAPI reports for a model, if any. */
+export function reportedMaxTokens(model: CodexClientModel): number | undefined {
+	for (const value of [model.max_tokens, model.max_output_tokens, model.max_completion_tokens]) {
+		if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+	}
+	return undefined;
+}
+
 export async function loadMappedModels(
 	baseUrlInput: string,
 	apiKey: string,
 	timeoutOrFastMode: number | boolean = MODELS_REQUEST_TIMEOUT_MS,
 	agentDir?: string,
 	signal?: AbortSignal,
-	claudeMessages = false,
+	claudeMessages: ClaudeMessagesMode | boolean = "off",
 ): Promise<MappedModels> {
+	const claudeMode = claudeMessagesMode(claudeMessages);
+	const claudeWanted = claudeMode !== "off";
 	const pricingEnabled = typeof timeoutOrFastMode === "boolean";
 	const effectiveFastMode = typeof timeoutOrFastMode === "boolean" ? timeoutOrFastMode : false;
 	const timeoutMs = typeof timeoutOrFastMode === "number" ? timeoutOrFastMode : MODELS_REQUEST_TIMEOUT_MS;
@@ -1416,16 +1430,16 @@ export async function loadMappedModels(
 		fetchCodexModels(endpoints.modelsUrl, apiKey, timeoutMs, signal),
 		pricingEnabled ? fetchModelsDevCostMap(agentDir, false, signal) : Promise.resolve(undefined),
 		pricingEnabled ? loadPromptCacheSources(agentDir, false, signal) : Promise.resolve(undefined),
-		claudeMessages
-			? fetchModelOwners(endpoints.plainModelsUrl, apiKey, timeoutMs, signal)
-			: Promise.resolve(undefined),
-		claudeMessages ? loadBuiltinClaudeFormatCatalog() : Promise.resolve(undefined),
+		claudeWanted ? fetchModelOwners(endpoints.plainModelsUrl, apiKey, timeoutMs, signal) : Promise.resolve(undefined),
+		claudeWanted ? loadBuiltinClaudeFormatCatalog() : Promise.resolve(undefined),
 	]);
 	const claudeFormatIds = new Set<string>();
 	const models = remoteModels
 		.map((model) => {
 			const claudeFormat =
-				owners && claudeCatalog ? claudeFormatFor(codexModelId(model), owners, claudeCatalog) : undefined;
+				owners && claudeCatalog && (claudeMode === "on" || reportedMaxTokens(model) !== undefined)
+					? claudeFormatFor(codexModelId(model), owners, claudeCatalog)
+					: undefined;
 			const mapped = toPiModel(model, costCatalog, effectiveFastMode, promptCacheSources, claudeFormat);
 			if (mapped && claudeFormat) claudeFormatIds.add(mapped.id);
 			return mapped;
@@ -1448,7 +1462,7 @@ export async function loadMappedModels(
 		inferenceBaseUrl: endpoints.inferenceBaseUrl,
 		modelsUrl: endpoints.modelsUrl,
 		...(pricingEnabled ? { fastMode: effectiveFastMode } : {}),
-		...(claudeMessages ? { claudeMessages: true } : {}),
+		...(claudeWanted ? { claudeMessages: claudeMode } : {}),
 	};
 }
 
@@ -1554,7 +1568,7 @@ export async function resolveMappedModels(
 		forceRefresh?: boolean;
 		replaceCache?: boolean;
 		fastMode?: boolean;
-		claudeMessages?: boolean;
+		claudeMessages?: ClaudeMessagesMode | boolean;
 		signal?: AbortSignal;
 		shouldCommit?: () => boolean;
 		staleTtlMs?: number;
@@ -1562,7 +1576,7 @@ export async function resolveMappedModels(
 ): Promise<ResolvedModelsResult> {
 	const cacheMatchesFastMode = (cache: ModelsCacheFile): boolean =>
 		(options.fastMode === undefined || (cache.fastMode ?? false) === options.fastMode) &&
-		(cache.claudeMessages ?? false) === (options.claudeMessages ?? false);
+		claudeMessagesMode(cache.claudeMessages) === claudeMessagesMode(options.claudeMessages);
 
 	const existingCache = loadModelsCache(agentDir, baseUrlInput);
 	if (!options.forceRefresh && !options.replaceCache) {
@@ -1577,7 +1591,7 @@ export async function resolveMappedModels(
 		options.fastMode,
 		agentDir,
 		options.signal,
-		options.claudeMessages ?? false,
+		options.claudeMessages ?? "off",
 	);
 	const { merged } = mergeModelsWithExistingCache(
 		options.replaceCache ? null : existingCache,
