@@ -577,10 +577,14 @@ export function toPiModel(
 			: undefined) ??
 		DEFAULT_MAX_TOKENS;
 
-	const promptCache = withReportedCacheLifetime(
+	const reportedCache = withReportedCacheLifetime(
 		promptCacheSources ? resolvePromptCache(id, promptCacheSources) : undefined,
 		model.prompt_cache_ttl_seconds,
 	);
+	// The Codex format sends the same request whatever the cache retention (PI_CACHE_RETENTION=long changes nothing
+	// on the wire), so the route keeps one lifetime. Declare it for both tiers: without a long tier, pi would treat
+	// "long" as an unknown lifetime and stop warming these models.
+	const promptCache = reportedCache?.short ? { short: reportedCache.short, long: reportedCache.short } : reportedCache;
 
 	return {
 		id,
