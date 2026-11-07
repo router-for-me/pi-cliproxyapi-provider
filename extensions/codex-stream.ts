@@ -19,6 +19,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Api, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import { getPackageDir } from "@earendil-works/pi-coding-agent";
 
 export const CLIPROXYAPI_CODEX_API = "cliproxyapi-codex-responses" as const;
 
@@ -788,6 +789,19 @@ const CODEX_MODULE_RELATIVE = join(
 	"openai-codex-responses.js",
 );
 
+const CODEX_MODULE_FLAT_RELATIVE = join(
+	"node_modules",
+	"@earendil-works",
+	"pi-ai",
+	"dist",
+	"openai-codex-responses.js",
+);
+
+const CODEX_DIST_SUBPATHS = [
+	join("dist", "api", "openai-codex-responses.js"),
+	join("dist", "openai-codex-responses.js"),
+] as const;
+
 /**
  * Well-known filesystem locations for openai-codex-responses.js on bundled hosts.
  *
@@ -816,6 +830,26 @@ export function wellKnownCodexModuleCandidates(homeDirectory: string): string[] 
 			"@earendil-works",
 			"pi-coding-agent",
 			CODEX_MODULE_RELATIVE,
+		),
+		join(homeDirectory, ".pi", "runtime", CODEX_MODULE_RELATIVE),
+		join(homeDirectory, ".pi", "runtime", CODEX_MODULE_FLAT_RELATIVE),
+		join(
+			homeDirectory,
+			".pi",
+			"runtime",
+			"node_modules",
+			"@earendil-works",
+			"pi-coding-agent",
+			CODEX_MODULE_RELATIVE,
+		),
+		join(
+			homeDirectory,
+			".pi",
+			"runtime",
+			"node_modules",
+			"@earendil-works",
+			"pi-coding-agent",
+			CODEX_MODULE_FLAT_RELATIVE,
 		),
 		join(homeDirectory, ".bun", "install", "global", CODEX_MODULE_RELATIVE),
 		join(
@@ -1047,16 +1081,33 @@ export function resolveCodexModuleFromNodeEntry(entryPath: string): string | und
 			const real = realpathSync(current);
 			const require = createRequire(pathToFileURL(real));
 			for (const nodeModulesDir of require.resolve.paths("@earendil-works/pi-ai") ?? []) {
-				const candidate = join(
-					nodeModulesDir,
-					"@earendil-works",
-					"pi-ai",
-					"dist",
-					"api",
-					"openai-codex-responses.js",
-				);
-				if (existsSync(candidate)) {
-					return candidate;
+				for (const distSubpath of CODEX_DIST_SUBPATHS) {
+					const directCandidate = join(nodeModulesDir, "@earendil-works", "pi-ai", distSubpath);
+					if (existsSync(directCandidate)) {
+						return directCandidate;
+					}
+					const nestedCandidate = join(
+						nodeModulesDir,
+						"@earendil-works",
+						"pi-coding-agent",
+						"node_modules",
+						"@earendil-works",
+						"pi-ai",
+						distSubpath,
+					);
+					if (existsSync(nestedCandidate)) {
+						return nestedCandidate;
+					}
+				}
+			}
+
+			// Managed Pi launcher (<agentDir>/bin/pi -> <agentDir>/install/releases/<version>)
+			const managedInstallDir = join(dirname(dirname(real)), "install");
+			const managedCurrentVersionPath = join(managedInstallDir, "current-version");
+			if (existsSync(managedCurrentVersionPath)) {
+				const currentVersion = readFileSync(managedCurrentVersionPath, "utf8").trim();
+				if (currentVersion) {
+					queue.push(join(managedInstallDir, "releases", currentVersion, "package.json"));
 				}
 			}
 
@@ -1071,12 +1122,32 @@ export function resolveCodexModuleFromNodeEntry(entryPath: string): string | und
 						queue.push(resolve(dirname(real), ref));
 					}
 				}
-				const homeJoinMatch = content.match(
-					/join\s*\(\s*(?:homedir\(\)|process\.env\.HOME)[^)]*["']([^"']+)["']\s*\)/,
-				);
-				if (homeJoinMatch) {
-					const home = process.env.HOME || process.env.USERPROFILE || homedir();
-					queue.push(join(home, homeJoinMatch[1]));
+				const defaultHome = process.env.HOME || process.env.USERPROFILE || homedir();
+				for (const homeJoinMatch of content.matchAll(
+					/join\s*\(\s*(homedir\(\)|process\.env\.HOME\b|process\.env\.USERPROFILE\b)\s*,([^)]*)\)/g,
+				)) {
+					const baseExpr = homeJoinMatch[1] ?? "";
+					const baseHomes =
+						baseExpr === "process.env.USERPROFILE"
+							? [process.env.USERPROFILE || defaultHome]
+							: baseExpr === "process.env.HOME"
+								? [process.env.HOME || defaultHome]
+								: Array.from(new Set([homedir(), defaultHome].filter(Boolean)));
+					const argsText = homeJoinMatch[2] ?? "";
+					const segments = [...argsText.matchAll(/["'`]([^"'`\r\n]+)["'`]/g)]
+						.map((m) => m[1]?.trim())
+						.filter((s): s is string => Boolean(s));
+					if (segments.length > 0) {
+						for (const baseHome of baseHomes) {
+							queue.push(join(baseHome, ...segments));
+						}
+					}
+				}
+				for (const shellHomeMatch of content.matchAll(/["'`]?(?:~|\$HOME|\$\{HOME\})([\\/][^"'`\s\r\n]+)["'`]?/g)) {
+					const rel = shellHomeMatch[1]?.trim();
+					if (rel) {
+						queue.push(join(defaultHome, rel.replace(/^[\\/]+/, "")));
+					}
 				}
 			}
 		} catch {
@@ -1084,6 +1155,38 @@ export function resolveCodexModuleFromNodeEntry(entryPath: string): string | und
 		}
 	}
 	return undefined;
+}
+
+function resolveManagedInstallCandidates(homeDirectory: string): string[] {
+	const installDirs = [join(homeDirectory, ".pi", "agent", "install")];
+	const candidates: string[] = [];
+	for (const installDir of installDirs) {
+		try {
+			const currentVersionPath = join(installDir, "current-version");
+			if (!existsSync(currentVersionPath)) continue;
+			const currentVersion = readFileSync(currentVersionPath, "utf8").trim();
+			if (!currentVersion) continue;
+			const releaseDir = join(installDir, "releases", currentVersion);
+			candidates.push(
+				join(releaseDir, CODEX_MODULE_RELATIVE),
+				join(releaseDir, CODEX_MODULE_FLAT_RELATIVE),
+				join(releaseDir, "node_modules", "@earendil-works", "pi-coding-agent", CODEX_MODULE_RELATIVE),
+				join(releaseDir, "node_modules", "@earendil-works", "pi-coding-agent", CODEX_MODULE_FLAT_RELATIVE),
+			);
+		} catch {
+			// Ignore unreadable managed install state.
+		}
+	}
+	return candidates;
+}
+
+function expandCodexCandidateVariants(candidate: string): string[] {
+	const apiSuffix = join("dist", "api", "openai-codex-responses.js");
+	if (candidate.endsWith(apiSuffix)) {
+		const flatCandidate = `${candidate.slice(0, -apiSuffix.length)}${join("dist", "openai-codex-responses.js")}`;
+		return [candidate, flatCandidate];
+	}
+	return [candidate];
 }
 
 export function computePatchedModuleCachePath(
@@ -1143,9 +1246,30 @@ export function resolveOriginalCodexModulePath(options: ResolveOriginalCodexModu
 		}
 	}
 
-	// Also check well-known CLI binaries if nodeEntry wasn't explicitly provided in options
+	// Also check the active pi-coding-agent package root and well-known CLI binaries
+	// if nodeEntry wasn't explicitly provided in options (e.g. inside subagent runners).
+	if (!("nodeEntry" in options) && !("resolveSpecifier" in options)) {
+		try {
+			if (typeof getPackageDir === "function") {
+				const packageDir = getPackageDir();
+				if (packageDir) {
+					const bundledHostModule = resolveCodexModuleFromNodeEntry(join(packageDir, "package.json"));
+					if (bundledHostModule && existsSync(bundledHostModule)) {
+						return { path: bundledHostModule, dir: dirname(bundledHostModule) };
+					}
+				}
+			}
+		} catch {
+			// Ignore when host does not expose a resolvable package directory.
+		}
+	}
+
 	if (!("nodeEntry" in options) && homeDirectory) {
 		const wellKnownEntries = [
+			join(homeDirectory, ".pi", "bin", "pi"),
+			join(homeDirectory, ".pi", "agent", "bin", "pi"),
+			join(homeDirectory, ".pi", "runtime", "bin", "pi"),
+			join(homeDirectory, ".pi", "runtime", "node_modules", ".bin", "pi"),
 			join(homeDirectory, ".bun", "bin", "pi"),
 			join(homeDirectory, ".local", "bin", "pi"),
 			join(homeDirectory, ".npm-global", "bin", "pi"),
@@ -1172,19 +1296,45 @@ export function resolveOriginalCodexModulePath(options: ResolveOriginalCodexModu
 	try {
 		const main = fileURLToPath(resolveSpecifier("@earendil-works/pi-ai"));
 		const distDir = dirname(main);
-		candidates.push(join(distDir, "api/openai-codex-responses.js"));
-		candidates.push(join(distDir, "openai-codex-responses.js"));
+		const directCandidates = [
+			join(distDir, "api/openai-codex-responses.js"),
+			join(distDir, "openai-codex-responses.js"),
+		];
+		candidates.push(...directCandidates);
+		// Pi >=1.5 maps @earendil-works/pi-ai to pi-coding-agent's extension view
+		// rather than pi-ai/dist. Resolve the physical pi-ai module from that host entry.
+		if (!directCandidates.some((candidate) => existsSync(candidate))) {
+			const hostModule = resolveCodexModuleFromNodeEntry(main);
+			if (hostModule) {
+				candidates.push(hostModule);
+			}
+		}
 	} catch {
 		// ignore
 	}
 
+	if (!candidates.some((candidate) => candidate && existsSync(candidate))) {
+		try {
+			const hostEntry = fileURLToPath(resolveSpecifier("@earendil-works/pi-coding-agent"));
+			const hostModule = resolveCodexModuleFromNodeEntry(hostEntry);
+			if (hostModule) {
+				candidates.push(hostModule);
+			}
+		} catch {
+			// ignore
+		}
+	}
+
 	if (homeDirectory) {
+		candidates.push(...resolveManagedInstallCandidates(homeDirectory));
 		candidates.push(...wellKnownCodexModuleCandidates(homeDirectory));
 	}
 
-	for (const path of candidates) {
-		if (path && existsSync(path)) {
-			return { path, dir: dirname(path) };
+	for (const candidate of candidates) {
+		for (const path of expandCodexCandidateVariants(candidate)) {
+			if (path && existsSync(path)) {
+				return { path, dir: dirname(path) };
+			}
 		}
 	}
 
@@ -1203,11 +1353,19 @@ export async function loadCliproxyCodexStreams(
 	// older hosts keep the classic request-level effort instead of pinning it
 	// to the baseline without carrying the real level.
 	const sharedSource = (() => {
-		try {
-			return readFileSync(join(dirname(originalPath), "openai-responses-shared.js"), "utf8");
-		} catch {
-			return "";
+		for (const candidate of [
+			join(dirname(originalPath), "openai-responses-shared.js"),
+			join(dirname(originalPath), "api", "openai-responses-shared.js"),
+		]) {
+			try {
+				if (existsSync(candidate)) {
+					return readFileSync(candidate, "utf8");
+				}
+			} catch {
+				// try next
+			}
 		}
+		return "";
 	})();
 	const supportsConfigurationUpdate = sharedSupportsConfigurationUpdate(sharedSource);
 	const patched = patchCodexSource(originalSource, providerIds, { supportsConfigurationUpdate });

@@ -41,6 +41,7 @@ function writeFile(path: string, contents: string): void {
 }
 
 const CODEX_RELATIVE = join("node_modules", "@earendil-works", "pi-ai", "dist", "api", "openai-codex-responses.js");
+const CODEX_FLAT_RELATIVE = join("node_modules", "@earendil-works", "pi-ai", "dist", "openai-codex-responses.js");
 
 function failingResolveSpecifier(): string {
 	throw Object.assign(new Error("Cannot find package '@earendil-works/pi-ai'"), { code: "ERR_MODULE_NOT_FOUND" });
@@ -98,6 +99,18 @@ describe("wellKnownCodexModuleCandidates", () => {
 				"@earendil-works",
 				"pi-coding-agent",
 				CODEX_RELATIVE,
+			),
+			join("/home/user", ".pi", "runtime", CODEX_RELATIVE),
+			join("/home/user", ".pi", "runtime", CODEX_FLAT_RELATIVE),
+			join("/home/user", ".pi", "runtime", "node_modules", "@earendil-works", "pi-coding-agent", CODEX_RELATIVE),
+			join(
+				"/home/user",
+				".pi",
+				"runtime",
+				"node_modules",
+				"@earendil-works",
+				"pi-coding-agent",
+				CODEX_FLAT_RELATIVE,
 			),
 			join("/home/user", ".bun", "install", "global", CODEX_RELATIVE),
 			join(
@@ -259,6 +272,202 @@ describe("resolveOriginalCodexModulePath", () => {
 		);
 
 		expect(resolveCodexModuleFromNodeEntry(wrapper)).toBe(codexModule);
+	});
+
+	it("resolves HOME/.pi/runtime flat dist/openai-codex-responses.js when subagent starts outside runtime tree", () => {
+		const home = tempDir("pi-cpa-runtime-home-");
+		const subagentRunner = join(home, ".pi", "agent", "npm", "node_modules", "pi-subagents", "dist", "runner.js");
+		const runtimeCodex = join(
+			home,
+			".pi",
+			"runtime",
+			"node_modules",
+			"@earendil-works",
+			"pi-ai",
+			"dist",
+			"openai-codex-responses.js",
+		);
+		writeFile(subagentRunner, "export {}\n");
+		writeFile(runtimeCodex, "export {}\n");
+
+		const resolved = resolveOriginalCodexModulePath({
+			resolveSpecifier: failingResolveSpecifier,
+			nodeEntry: subagentRunner,
+			homeDirectory: home,
+		});
+
+		expect(resolved.path).toBe(runtimeCodex);
+		expect(resolved.dir).toBe(dirname(runtimeCodex));
+	});
+
+	it("resolves multi-argument join(homedir(), '.pi', 'runtime', ...) and USERPROFILE wrapper scripts with flat dist layout", () => {
+		const home = tempDir("pi-cpa-home-join-");
+		const userProfile = tempDir("pi-cpa-userprofile-join-");
+		const runtimeCli = join(
+			home,
+			".pi",
+			"runtime",
+			"node_modules",
+			"@earendil-works",
+			"pi-coding-agent",
+			"dist",
+			"cli.js",
+		);
+		const runtimeCodex = join(
+			home,
+			".pi",
+			"runtime",
+			"node_modules",
+			"@earendil-works",
+			"pi-ai",
+			"dist",
+			"openai-codex-responses.js",
+		);
+		const profileCli = join(
+			userProfile,
+			".pi",
+			"runtime",
+			"node_modules",
+			"@earendil-works",
+			"pi-coding-agent",
+			"dist",
+			"cli.js",
+		);
+		const profileCodex = join(
+			userProfile,
+			".pi",
+			"runtime",
+			"node_modules",
+			"@earendil-works",
+			"pi-ai",
+			"dist",
+			"openai-codex-responses.js",
+		);
+		const homedirWrapper = join(home, "bin", "pi-homedir");
+		const envHomeWrapper = join(home, "bin", "pi-env-home");
+		const userProfileWrapper = join(home, "bin", "pi-userprofile");
+		writeFile(runtimeCli, "export {}\n");
+		writeFile(runtimeCodex, "export {}\n");
+		writeFile(profileCli, "export {}\n");
+		writeFile(profileCodex, "export {}\n");
+		writeFile(
+			homedirWrapper,
+			`import { homedir } from "node:os";\nimport { join } from "node:path";\nconst entry = join(homedir(), ".pi", "runtime", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");\nawait import(entry);\n`,
+		);
+		writeFile(
+			envHomeWrapper,
+			`import { join } from "node:path";\nconst entry = join(process.env.HOME, ".pi", "runtime", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");\nawait import(entry);\n`,
+		);
+		writeFile(
+			userProfileWrapper,
+			`import { join } from "node:path";\nconst entry = join(process.env.USERPROFILE, ".pi", "runtime", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");\nawait import(entry);\n`,
+		);
+
+		const prevHome = process.env.HOME;
+		const prevUserProfile = process.env.USERPROFILE;
+		try {
+			process.env.HOME = home;
+			process.env.USERPROFILE = home;
+			expect(resolveCodexModuleFromNodeEntry(homedirWrapper)).toBe(runtimeCodex);
+
+			process.env.HOME = home;
+			process.env.USERPROFILE = userProfile;
+			expect(resolveCodexModuleFromNodeEntry(envHomeWrapper)).toBe(runtimeCodex);
+			expect(resolveCodexModuleFromNodeEntry(userProfileWrapper)).toBe(profileCodex);
+		} finally {
+			if (prevHome === undefined) {
+				delete process.env.HOME;
+			} else {
+				process.env.HOME = prevHome;
+			}
+			if (prevUserProfile === undefined) {
+				delete process.env.USERPROFILE;
+			} else {
+				process.env.USERPROFILE = prevUserProfile;
+			}
+		}
+	});
+
+	it("resolves physical pi-ai module when Pi >=1.5 aliases @earendil-works/pi-ai to pi-ai-extension-view.js", () => {
+		const hostRoot = tempDir("pi-cpa-pi15-root-");
+		const runnerRoot = tempDir("pi-cpa-pi15-runner-");
+		const extensionView = join(
+			hostRoot,
+			"node_modules",
+			"@earendil-works",
+			"pi-coding-agent",
+			"dist",
+			"core",
+			"extensions",
+			"pi-ai-extension-view.js",
+		);
+		const hostCodex = join(
+			hostRoot,
+			"node_modules",
+			"@earendil-works",
+			"pi-ai",
+			"dist",
+			"api",
+			"openai-codex-responses.js",
+		);
+		const subagentRunner = join(runnerRoot, "subagent-runner", "runner.js");
+		writeFile(extensionView, "export {}\n");
+		writeFile(hostCodex, "export {}\n");
+		writeFile(subagentRunner, "export {}\n");
+
+		const resolvedSpecifiers: string[] = [];
+		const resolved = resolveOriginalCodexModulePath({
+			nodeEntry: subagentRunner,
+			homeDirectory: tempDir("pi-cpa-empty-home-"),
+			resolveSpecifier: (specifier) => {
+				resolvedSpecifiers.push(specifier);
+				if (specifier === "@earendil-works/pi-ai") {
+					return pathToFileURL(extensionView).href;
+				}
+				throw Object.assign(new Error(`Cannot find module '${specifier}'`), { code: "ERR_MODULE_NOT_FOUND" });
+			},
+		});
+
+		expect(resolvedSpecifiers).toContain("@earendil-works/pi-ai");
+		expect(resolved.path).toBe(hostCodex);
+	});
+
+	it("resolves managed Pi installation under HOME/.pi/agent/install/releases/<current-version> and launcher script", () => {
+		const home = tempDir("pi-cpa-managed-home-");
+		const runnerRoot = tempDir("pi-cpa-managed-runner-");
+		const subagentRunner = join(runnerRoot, "runner.js");
+		const managedLauncher = join(home, ".pi", "agent", "bin", "pi");
+		const managedVersionFile = join(home, ".pi", "agent", "install", "current-version");
+		const managedPackageJson = join(home, ".pi", "agent", "install", "releases", "1.5.0", "package.json");
+		const managedCodex = join(
+			home,
+			".pi",
+			"agent",
+			"install",
+			"releases",
+			"1.5.0",
+			"node_modules",
+			"@earendil-works",
+			"pi-ai",
+			"dist",
+			"api",
+			"openai-codex-responses.js",
+		);
+		writeFile(subagentRunner, "export {}\n");
+		writeFile(managedLauncher, "#!/bin/sh\n");
+		writeFile(managedVersionFile, "1.5.0\n");
+		writeFile(managedPackageJson, "{}\n");
+		writeFile(managedCodex, "export {}\n");
+
+		expect(resolveCodexModuleFromNodeEntry(managedLauncher)).toBe(managedCodex);
+
+		const resolved = resolveOriginalCodexModulePath({
+			resolveSpecifier: failingResolveSpecifier,
+			nodeEntry: subagentRunner,
+			homeDirectory: home,
+		});
+
+		expect(resolved.path).toBe(managedCodex);
 	});
 });
 

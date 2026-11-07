@@ -796,9 +796,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const fastMode = new FastModeController(fastEnabled);
 	const modelRefreshCoordinator = new ModelRefreshCoordinator();
 
+	let streamLoadError: string | undefined;
 	let streamSimple: CliproxyCodexStreamSimple = () => {
+		const suffix = streamLoadError ? `: ${streamLoadError}` : "";
 		throw new Error(
-			`Codex protocol stream is unavailable for provider: ${identity.providerId} (api: ${CLIPROXYAPI_CODEX_API})`,
+			`Codex protocol stream is unavailable for provider: ${identity.providerId} (api: ${CLIPROXYAPI_CODEX_API})${suffix}`,
 		);
 	};
 	try {
@@ -891,6 +893,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
+		streamLoadError = message;
 		logWarn(`failed to load patched codex protocol: ${message}`);
 	}
 
