@@ -27,6 +27,7 @@ const CLIPROXYAPI_ENV_NAMES = [
 	"CLIPROXYAPI_FAST",
 	"CLIPROXYAPI_PROVIDER_ID",
 	"CLIPROXYAPI_PROVIDER_NAME",
+	"CLIPROXYAPI_CLAUDE_MESSAGES",
 ] as const;
 
 function createModel(id: string): PiProviderModel {
@@ -71,8 +72,17 @@ function tempAgentDir(): string {
 	return dir;
 }
 
-function writeConfig(agentDir: string, config: { baseUrl?: string; apiKey?: string }): void {
-	writeFileSync(join(agentDir, CONFIG_FILE_NAME), JSON.stringify(config, null, 2), "utf8");
+// These tests are about caching and recovery and count requests, so they keep the Claude Messages format off
+// unless a test sets it; "auto" (the default) adds a request for CLIProxyAPI's owner list.
+function writeConfig(
+	agentDir: string,
+	config: { baseUrl?: string; apiKey?: string; claudeMessages?: boolean | "auto" },
+): void {
+	writeFileSync(
+		join(agentDir, CONFIG_FILE_NAME),
+		JSON.stringify({ claudeMessages: false, ...config }, null, 2),
+		"utf8",
+	);
 }
 
 async function waitForAsyncRefresh(): Promise<void> {
@@ -262,7 +272,7 @@ describe("resolveMappedModels cache behavior", () => {
 
 		try {
 			const result = await resolveMappedModels(agentDir, "http://127.0.0.1:8317", "key", { fastMode: true });
-			expect(fetchMock).toHaveBeenCalledTimes(2);
+			expect(fetchMock).toHaveBeenCalledTimes(3);
 			expect(result.fromCache).toBe(false);
 			expect(result.loaded.models[0]?.id).toBe("remote-fast");
 			expect(loadModelsCache(agentDir, "http://127.0.0.1:8317")?.fastMode).toBe(true);
@@ -503,7 +513,7 @@ describe("provider startup cache behavior", () => {
 			try {
 				const startup = providerExtension(pi);
 				await waitForAsyncRefresh();
-				expect(fetchMock).toHaveBeenCalledTimes(2);
+				expect(fetchMock).toHaveBeenCalledTimes(3);
 				releaseRemote(
 					new Response(JSON.stringify({ models: [createCodexModel("startup-remote")] }), { status: 200 }),
 				);
@@ -511,6 +521,95 @@ describe("provider startup cache behavior", () => {
 
 				const diskCache = loadModelsCache(agentDir, "http://127.0.0.1:8317");
 				expect(diskCache?.models[0].id).toBe("startup-remote");
+			} finally {
+				fetchMock.mockRestore();
+			}
+		});
+	});
+
+	it("registers Claude-format models with the Claude Messages base URL when claudeMessages is on", async () => {
+		await withTempAgentDir(async (agentDir) => {
+			writeConfig(agentDir, { baseUrl: "http://127.0.0.1:8317", apiKey: "key", claudeMessages: true });
+			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+				const url = String(input);
+				if (url.includes("models.dev")) return new Response("{}", { status: 200 });
+				if (url.includes("client_version")) {
+					return new Response(
+						JSON.stringify({ models: [createCodexModel("claude-haiku-4-5"), createCodexModel("gpt-remote")] }),
+						{ status: 200 },
+					);
+				}
+				return new Response(
+					JSON.stringify({
+						data: [
+							{ id: "claude-haiku-4-5", owned_by: "anthropic" },
+							{ id: "gpt-remote", owned_by: "openai" },
+						],
+					}),
+					{ status: 200 },
+				);
+			});
+			const { pi } = createPiMock();
+			try {
+				await providerExtension(pi);
+				const calls = (pi.registerProvider as unknown as { mock: { calls: any[][] } }).mock.calls;
+				const models = calls.at(-1)?.[1]?.models as Array<{ id: string; api?: string; baseUrl?: string }>;
+				const claude = models.find((m) => m.id === "claude-haiku-4-5");
+				const gpt = models.find((m) => m.id === "gpt-remote");
+				expect(claude).toMatchObject({ api: "anthropic-messages", baseUrl: "http://127.0.0.1:8317" });
+				expect(gpt?.api).toBeUndefined();
+				expect(gpt?.baseUrl).toBeUndefined();
+			} finally {
+				fetchMock.mockRestore();
+			}
+		});
+	});
+
+	it("uses the Claude Messages format by default only for Claude models CLIProxyAPI reports an output limit for", async () => {
+		await withTempAgentDir(async (agentDir) => {
+			writeFileSync(
+				join(agentDir, CONFIG_FILE_NAME),
+				JSON.stringify({ baseUrl: "http://127.0.0.1:8317", apiKey: "key" }),
+				"utf8",
+			);
+			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+				const url = String(input);
+				if (url.includes("models.dev")) return new Response("{}", { status: 200 });
+				if (url.includes("client_version")) {
+					return new Response(
+						JSON.stringify({
+							models: [
+								{ ...createCodexModel("claude-haiku-4-5"), max_tokens: 64000 },
+								createCodexModel("claude-opus-4-5"),
+								{ ...createCodexModel("gpt-remote"), max_tokens: 128000 },
+							],
+						}),
+						{ status: 200 },
+					);
+				}
+				return new Response(
+					JSON.stringify({
+						data: [
+							{ id: "claude-haiku-4-5", owned_by: "anthropic" },
+							{ id: "claude-opus-4-5", owned_by: "anthropic" },
+							{ id: "gpt-remote", owned_by: "openai" },
+						],
+					}),
+					{ status: 200 },
+				);
+			});
+			const { pi } = createPiMock();
+			try {
+				await providerExtension(pi);
+				const calls = (pi.registerProvider as unknown as { mock: { calls: any[][] } }).mock.calls;
+				const models = calls.at(-1)?.[1]?.models as Array<{ id: string; api?: string; maxTokens?: number }>;
+				expect(models.find((m) => m.id === "claude-haiku-4-5")).toMatchObject({
+					api: "anthropic-messages",
+					maxTokens: 64000,
+				});
+				// No reported output limit: the Messages format would cap replies at the 16,384 default.
+				expect(models.find((m) => m.id === "claude-opus-4-5")?.api).toBeUndefined();
+				expect(models.find((m) => m.id === "gpt-remote")?.api).toBeUndefined();
 			} finally {
 				fetchMock.mockRestore();
 			}
@@ -537,7 +636,7 @@ describe("provider startup cache behavior", () => {
 
 			try {
 				await expect(providerExtension(pi)).resolves.toBeUndefined();
-				expect(fetchMock).toHaveBeenCalledTimes(2);
+				expect(fetchMock).toHaveBeenCalledTimes(3);
 				expect(commands.has("cliproxyapi-refresh")).toBe(true);
 
 				const initialCallsWithModels = (
@@ -629,7 +728,7 @@ describe("provider startup cache behavior", () => {
 			try {
 				await expect(providerExtension(pi)).resolves.toBeUndefined();
 				await waitForAsyncRefresh();
-				expect(fetchMock).toHaveBeenCalledTimes(2);
+				expect(fetchMock).toHaveBeenCalledTimes(3);
 				expect(warnMock).not.toHaveBeenCalledWith(expect.stringContaining("failed to refresh cached models"));
 
 				const callsWithModels = (
@@ -1195,7 +1294,7 @@ describe("/cliproxyapi-refresh command", () => {
 
 				await refresh.handler("", ctx);
 
-				expect(fetchMock).toHaveBeenCalledTimes(4);
+				expect(fetchMock).toHaveBeenCalledTimes(6);
 				expect(notify).toHaveBeenCalledWith(expect.stringContaining("Refreshed 1 CLIProxyAPI models"), "info");
 
 				const diskCache = loadModelsCache(agentDir, "http://127.0.0.1:8317");
@@ -1242,6 +1341,8 @@ describe("/cliproxyapi-refresh command", () => {
 	it("schedules auto-recovery when login encounters stale models", async () => {
 		vi.useFakeTimers();
 		await withTempAgentDir(async (agentDir) => {
+			// Counts model-list requests; the default Claude Messages mode would add the owner list.
+			process.env.CLIPROXYAPI_CLAUDE_MESSAGES = "off";
 			const cached = createMappedModels({
 				models: [createModel("gemini-3.8-flash-high"), createModel("gpt-4o")],
 			});

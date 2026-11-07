@@ -100,6 +100,7 @@ Optional fields:
 | `providerName` | `CLIProxyAPI` | Display name in `/login` and UI |
 | `fast` | `false` | Persisted Fast mode preference; only applies to catalog-supported models |
 | `pause` | `false` | Persisted request-pause preference; provider requests wait until it is cleared |
+| `claudeMessages` | `"auto"` | When Claude models use Claude's own format: `"auto"`, `true` (always) or `false` (never); see [Claude Messages format](#claude-messages-format) |
 
 ### Environment overrides
 
@@ -110,6 +111,7 @@ Optional fields:
 | `CLIPROXYAPI_PROVIDER_ID` | `providerId` |
 | `CLIPROXYAPI_PROVIDER_NAME` | `providerName` |
 | `CLIPROXYAPI_FAST` | `fast` (`true` / `false`, also accepts `1`, `0`, `yes`, `no`, `on`, `off`) |
+| `CLIPROXYAPI_CLAUDE_MESSAGES` | `claudeMessages` (`auto`, or the same values as `CLIPROXYAPI_FAST`) |
 
 Resolution order for connection settings:
 
@@ -216,6 +218,60 @@ Unsupported pi thinking levels are set to `null` so they are hidden in the UI. W
 Models whose catalog entry sets `supports_reasoning_effort_updates` (GPT-6 on CLIProxyAPI) get pi's cache-preserving mid-session thinking level changes, matching the behavior pi >=1.3.0 ships for the OpenAI provider, with placement following the OpenAI documentation: the effort of the first turn becomes the fixed request-level `reasoning.effort`, and each later change is carried by a `configuration_update` input item placed immediately before the user message it applies to, so switching levels mid-session keeps the prompt prefix — and the upstream prompt cache — intact instead of rewriting it. WebSocket `previous_response_id` continuation also survives level changes. Histories lacking initial recorded levels (for example, sessions started before this support landed) may still need one full-context request while the baseline is being established. The behavior requires a pi >=1.3.0 host (its shared Responses converter); on older hosts the plugin detects the missing support and falls back to the classic request-level effort.
 
 The raw `models.dev` response is cached for 24 hours at `~/.pi/agent/tmp/models-dev-cache.json`. A fresh cache avoids the network request; an expired cache is refreshed with a three-second timeout, and stale data is retained if refresh fails. If neither the network nor a previous cache is available, pricing safely falls back to zero. A small explicit alias table covers known CLIProxyAPI variants such as `gemini-pro-agent` → `gemini-3.1-pro-preview`; unknown variants are not guessed.
+
+## Prompt-cache warming
+
+pi can keep a prompt cache warm while you pause (`cacheWarming` in pi's settings): shortly before the cache expires it
+re-sends the conversation with a 1-token answer. It does this only for models that declare their cache lifetime, so the
+plugin declares `promptCache.short` for every model whose lifetime is known:
+
+- **Sources:** pi's built-in catalog and the `capabilities.cache.explicit.ttl` lists in the
+  [models.dev v2 data](https://models.dev/experimental/v2.0/api.json), matched like prices. The shortest known value
+  wins (Claude: 300 s, GPT-6.1: 1800 s). Declaring a lifetime that is too short only adds cheap warm-ups; one that is too
+  long would make pi warm after the cache is gone.
+- **Reported by CLIProxyAPI:** when CLIProxyAPI's model list carries `prompt_cache_ttl_seconds` for a model (the
+  [pools plugin](https://github.com/ngvoicu/cpa-pools-and-aliases) reports it for pools whose members all cache, e.g.
+  3600 for a pool of Claude logins), that value replaces the catalog's default tier: it describes the route, the
+  catalog only the model.
+- **No guessing:** models with only implicit caching or no cache data declare nothing, and pi does not warm them.
+  `long` is not declared, because CLIProxyAPI decides the upstream lifetime itself.
+- **No-cache guard:** behind CLIProxyAPI one model id can be served by a route that does not cache. pi does not check its
+  warm-ups, so on such a route each one would re-bill the whole prompt. When the latest response (a turn or a warm-up)
+  read less than 10 % of the prompt the previous response sent, within the cache lifetime, the plugin stops warming until
+  your next message. A route without caching costs at most one warm-up.
+
+The models.dev v2 lifetimes are cached for 24 hours at `~/.pi/agent/tmp/models-dev-prompt-cache.json` (only the parsed
+lifetimes, not the full file), with the same stale-copy fallback as prices. Lifetimes are loaded together with prices, so
+`/cliproxyapi-refresh` updates both.
+
+## Claude Messages format
+
+Claude models can be sent in Claude's own format to CLIProxyAPI's `/v1/messages`, using pi's built-in Anthropic client,
+instead of the Codex Responses format every other model uses. This happens automatically; nothing needs configuring.
+
+- **Which models:** those CLIProxyAPI lists with `owned_by: "anthropic"` (from its plain `/v1/models`) that pi's
+  built-in catalog also knows, **and** for which CLIProxyAPI reports an output limit (`max_tokens`). Their compat
+  flags, thinking levels and cache tiers come from that catalog. Every other model, Claude models pi doesn't know, and
+  Claude models without a reported output limit stay on the Codex format. Pool aliases work: CLIProxyAPI translates
+  the request for non-Claude members (verified with Devin and an OpenAI-compatible OpenRouter entry).
+- **Setting:** `claudeMessages` in `cliproxyapi.json` (or `CLIPROXYAPI_CLAUDE_MESSAGES`) is `"auto"` by default.
+  `false` keeps every model on the Codex format; `true` also switches Claude models CLIProxyAPI reports no output
+  limit for (they then get pi's 16,384 default, see below).
+- **Why:** Claude's format can carry Anthropic features the Codex format can't. The main one is the **1-hour cache**:
+  with `PI_CACHE_RETENTION=long`, pi marks the prompt with `cache_control` `ttl: "1h"`, CLIProxyAPI passes it through,
+  and Anthropic writes the 1-hour tier, on API keys too. These models declare `promptCache: { short: 300, long: 3600 }`,
+  so pi plans warming accordingly (with `long`, the first refresh would fall past pi's 30-minute idle limit, so idle
+  sessions aren't warmed at all). One-hour cache writes cost 2× the input price instead of 1.25×.
+- **Limits come from CLIProxyAPI:** the context window and output limit are what CLIProxyAPI reports, as for every
+  other model. Unlike the Codex format, Claude's format sends the output limit (`max_tokens`) on every request. CLIProxyAPI
+  versions without router-for-me/CLIProxyAPI#7278 report Claude models configured under an API key (aliases) with a
+  500k window and no output limit. In `"auto"` such models stay on the Codex format, which sends no output limit;
+  with `true` pi would fall back to 16,384 output tokens. Update CLIProxyAPI to get the real values.
+  (`max-context-length` on the model in CLIProxyAPI's config fixes the window only.)
+- **Not available for these models:** Fast mode (a Codex service tier) and the Codex WebSocket transport. Thinking,
+  tools, images, warming, the no-cache guard and auto-compaction work as before.
+- Changing the setting refreshes the model list (the cache records it). The first request of an ongoing session after
+  a model switches formats is a cache miss.
 
 ## Migration from static models.json
 
