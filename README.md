@@ -217,6 +217,31 @@ Models whose catalog entry sets `supports_reasoning_effort_updates` (GPT-6 on CL
 
 The raw `models.dev` response is cached for 24 hours at `~/.pi/agent/tmp/models-dev-cache.json`. A fresh cache avoids the network request; an expired cache is refreshed with a three-second timeout, and stale data is retained if refresh fails. If neither the network nor a previous cache is available, pricing safely falls back to zero. A small explicit alias table covers known CLIProxyAPI variants such as `gemini-pro-agent` → `gemini-3.1-pro-preview`; unknown variants are not guessed.
 
+## Prompt-cache warming
+
+pi can keep a prompt cache warm while you pause (`cacheWarming` in pi's settings): shortly before the cache expires it
+re-sends the conversation with a 1-token answer. It does this only for models that declare their cache lifetime, so the
+plugin declares `promptCache.short` for every model whose lifetime is known:
+
+- **Sources:** pi's built-in catalog and the `capabilities.cache.explicit.ttl` lists in the
+  [models.dev v2 data](https://models.dev/experimental/v2.0/api.json), matched like prices. The shortest known value
+  wins (Claude: 300 s, GPT-6.1: 1800 s). Declaring a lifetime that is too short only adds cheap warm-ups; one that is too
+  long would make pi warm after the cache is gone.
+- **Reported by CLIProxyAPI:** when CLIProxyAPI's model list carries `prompt_cache_ttl_seconds` for a model (the
+  [pools plugin](https://github.com/ngvoicu/cpa-pools-and-aliases) reports it for pools whose members all cache, e.g.
+  3600 for a pool of Claude logins), that value replaces the catalog's default tier: it describes the route, the
+  catalog only the model.
+- **No guessing:** models with only implicit caching or no cache data declare nothing, and pi does not warm them.
+  `long` is not declared, because CLIProxyAPI decides the upstream lifetime itself.
+- **No-cache guard:** behind CLIProxyAPI one model id can be served by a route that does not cache. pi does not check its
+  warm-ups, so on such a route each one would re-bill the whole prompt. When the latest response (a turn or a warm-up)
+  read less than 10 % of the prompt the previous response sent, within the cache lifetime, the plugin stops warming until
+  your next message. A route without caching costs at most one warm-up.
+
+The models.dev v2 lifetimes are cached for 24 hours at `~/.pi/agent/tmp/models-dev-prompt-cache.json` (only the parsed
+lifetimes, not the full file), with the same stale-copy fallback as prices. Lifetimes are loaded together with prices, so
+`/cliproxyapi-refresh` updates both.
+
 ## Migration from static models.json
 
 If you previously maintained a static provider such as `cpa-responses` in `~/.pi/agent/models.json`:
