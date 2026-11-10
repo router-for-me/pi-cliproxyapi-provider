@@ -152,6 +152,15 @@ describe("proactive compaction controller", () => {
 		expect(closeWebSocketSessions).toHaveBeenCalledTimes(1);
 	});
 
+	it("closes the reused Codex WebSocket after tree navigation", async () => {
+		const { ctx, handlers, model, wrapped, baseResult, closeWebSocketSessions, sessionId } = setup();
+		await handlers.get("turn_end")?.({ message: assistantMessage(THRESHOLD + 1), toolResults: [{}] }, ctx);
+		handlers.get("session_tree")?.({}, ctx);
+		expect(closeWebSocketSessions).toHaveBeenCalledTimes(1);
+		expect(closeWebSocketSessions).toHaveBeenCalledWith(sessionId);
+		expect(wrapped(model, { messages: [] }, { sessionId })).toBe(baseResult);
+	});
+
 	it("does not close a WebSocket when the session id is missing", () => {
 		const { handlers, closeWebSocketSessions } = setup();
 		handlers.get("session_compact")?.({ reason: "manual" }, {
