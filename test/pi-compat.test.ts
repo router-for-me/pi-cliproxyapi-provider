@@ -8,7 +8,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { PROACTIVE_COMPACTION_ERROR_PREFIX } from "../extensions/auto-compact.ts";
 import type { CliproxyCodexStreamSimple } from "../extensions/codex-stream.ts";
 import * as codexStream from "../extensions/codex-stream.ts";
-import providerExtension, { COMPAT_SOURCE_ID, resetCompatCoordinator } from "../extensions/index.ts";
+import providerExtension, {
+	COMPAT_SOURCE_ID,
+	resetCompatCoordinator,
+	resetFallbackOpenAi,
+} from "../extensions/index.ts";
 import { AUTH_FILE_NAME } from "../extensions/lib.ts";
 
 const CLIPROXYAPI_ENV_NAMES = [
@@ -83,6 +87,7 @@ function createPiMock(commands: Map<string, Parameters<ExtensionAPI["registerCom
 describe("pi 0.82.0 compatibility", () => {
 	afterEach(() => {
 		resetCompatCoordinator();
+		resetFallbackOpenAi();
 		unregisterApiProviders(COMPAT_SOURCE_ID);
 	});
 
@@ -569,6 +574,31 @@ describe("pi 0.82.0 compatibility", () => {
 				}
 
 				expect(closeWebSocketSessionsMock).toHaveBeenCalled();
+			} finally {
+				spy.mockRestore();
+			}
+		});
+	});
+	it("gracefully falls back to standard openai-completions API when loadCliproxyCodexStreams fails (standalone/NixOS binary)", async () => {
+		await withTempAgentDir(async () => {
+			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const { pi } = createPiMock(commands);
+
+			const spy = vi
+				.spyOn(codexStream, "loadCliproxyCodexStreams")
+				.mockRejectedValue(
+					new Error("Cannot resolve openai-codex-responses.js (standalone/NixOS binary environment)"),
+				);
+
+			try {
+				await expect(providerExtension(pi)).resolves.toBeUndefined();
+				expect(pi.registerProvider).toHaveBeenCalledWith(
+					"cliproxyapi",
+					expect.objectContaining({
+						api: "openai-completions",
+						baseUrl: "http://127.0.0.1:8317/v1",
+					}),
+				);
 			} finally {
 				spy.mockRestore();
 			}
