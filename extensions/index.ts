@@ -470,15 +470,23 @@ function createOAuthHandlers(options: {
 				return models;
 			}
 			try {
-				const { inferenceBaseUrl } = resolveEndpoints(meta.baseUrl);
+				const { inferenceBaseUrl, rootOrigin } = resolveEndpoints(meta.baseUrl);
+				const targetBaseUrl = globalFallbackOpenAi ? `${rootOrigin}/v1` : inferenceBaseUrl;
 				return models.map((model) =>
-					model.provider === providerId ? { ...model, baseUrl: inferenceBaseUrl } : model,
+					model.provider === providerId ? { ...model, baseUrl: targetBaseUrl } : model,
 				);
 			} catch {
 				return models;
 			}
 		},
 	};
+}
+
+// Fall back to native openai-completions on standalone/NixOS binaries when unbundled JS files are absent
+let globalFallbackOpenAi = false;
+
+export function resetFallbackOpenAi(): void {
+	globalFallbackOpenAi = false;
 }
 
 function registerProvider(
@@ -531,11 +539,15 @@ function registerProvider(
 	// via registerProvider merge semantics and reintroduce the auth-type selector.
 	pi.unregisterProvider(providerId);
 
+	// Fall back to native openai-completions and /v1 endpoint if Codex patch is unavailable
+	const api = globalFallbackOpenAi ? "openai-completions" : CLIPROXYAPI_CODEX_API;
+	const baseUrl = globalFallbackOpenAi ? `${endpoints.rootOrigin}/v1` : endpoints.inferenceBaseUrl;
+
 	pi.registerProvider(providerId, {
 		name: providerName,
-		baseUrl: endpoints.inferenceBaseUrl,
-		api: CLIPROXYAPI_CODEX_API,
-		streamSimple,
+		baseUrl,
+		api,
+		...(globalFallbackOpenAi ? {} : { streamSimple }),
 		// OAuth-only keeps `/login <provider>` on the multi-field account path.
 		// Pass apiKey only for ambient request auth when no /login credential exists
 		// (config file / env). Never pass both for /login flows.
@@ -894,7 +906,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		streamLoadError = message;
-		logWarn(`failed to load patched codex protocol: ${message}`);
+		// Recover gracefully in standalone or bundled runtimes where physical files cannot be patched
+		globalFallbackOpenAi = true;
+		logWarn(
+			`failed to load patched codex protocol (${message}); falling back to native OpenAI completions for CLIProxyAPI`,
+		);
 	}
 
 	const fastFooter = new FastFooterController(identity.providerId, fastMode, () =>
