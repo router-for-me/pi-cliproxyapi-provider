@@ -83,9 +83,11 @@ export default function (pi: ExtensionAPI) {
 		return parts.join(" ");
 	}
 
-	function setElapsedStatus(ctx: ExtensionContext, totalSeconds: number): void {
+	// "working …" while a run is in flight, "last turn …" once it settles, so the footer says which one it is.
+	function setElapsedStatus(ctx: ExtensionContext, totalSeconds: number, settled = false): void {
 		if (!isPrimaryUiSession(ctx)) return;
-		ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("dim", `Elapsed ${formatElapsed(totalSeconds)}`));
+		const label = settled ? "last turn" : "working";
+		ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("dim", `${label} ${formatElapsed(totalSeconds)}`));
 	}
 
 	function refreshStatus(): void {
@@ -153,7 +155,7 @@ export default function (pi: ExtensionAPI) {
 		clearRefreshTimer();
 
 		// Keep the final total time in the footer after the run settles.
-		setElapsedStatus(ctx, elapsedSecondsFloor);
+		setElapsedStatus(ctx, elapsedSecondsFloor, true);
 		statusCtx = ctx;
 
 		if (elapsedMs <= 0) return;
