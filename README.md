@@ -163,7 +163,7 @@ Use `/continue` to clear the pause:
 /continue
 ```
 
-Both commands persist the `pause` boolean in `~/.pi/agent/cliproxyapi.json`. Before every provider request, the extension rereads this setting. When it is `true`, the request waits asynchronously and checks again every 200 ms until `/continue` sets it to `false`. A pause issued during an active run lets that run finish before Elapsed stops; a run that starts while paused excludes its waiting time from Elapsed and TPS.
+Both commands persist the `pause` boolean in `~/.pi/agent/cliproxyapi.json`. Before every provider request, the extension rereads this setting. When it is `true`, the request waits asynchronously and checks again every 200 ms until `/continue` sets it to `false`. A pause issued during an active run lets that run finish before the elapsed timer stops; a run that starts while paused excludes its waiting time from the elapsed time and TPS.
 
 ## Model cache
 
@@ -229,8 +229,8 @@ If you previously maintained a static provider such as `cpa-responses` in `~/.pi
 
 The package also registers `extensions/tps.ts`, which only activates for the primary interactive TUI session (`ctx.hasUI && ctx.mode === "tui"`):
 
-- While the agent is running, the footer shows `Elapsed …` (updates every second).
-- When the agent settles, the footer keeps the final elapsed time and a notification reports approximate TPS plus token usage (`out` / `in` / cache r/w / total).
+- While the agent is running, the footer shows `working …` (updates every second).
+- When the agent settles, the footer keeps the final time as `last turn …` and a notification reports approximate TPS plus token usage (`out` / `in` / cache r/w / total).
 - Subagent and print-mode sessions do not own the timer, clear the parent footer, or emit TPS toasts.
 
 Disable just this helper via `pi config` if you only want the CLIProxyAPI provider.
