@@ -70,7 +70,15 @@ describe("resolveEndpoints", () => {
 			inferenceBaseUrl: "http://127.0.0.1:8317/backend-api/",
 			modelsUrl: "http://127.0.0.1:8317/v1/models?client_version=pi",
 			rootOrigin: "http://127.0.0.1:8317",
+			messagesBaseUrl: "http://127.0.0.1:8317",
+			plainModelsUrl: "http://127.0.0.1:8317/v1/models",
 		});
+	});
+
+	it("derives the Claude Messages base and plain model list under a path prefix", () => {
+		const result = resolveEndpoints("https://proxy.example.com/cpa/v1");
+		expect(result.messagesBaseUrl).toBe("https://proxy.example.com/cpa");
+		expect(result.plainModelsUrl).toBe("https://proxy.example.com/cpa/v1/models");
 	});
 
 	it("keeps /backend-api for inference", () => {
