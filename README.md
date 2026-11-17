@@ -202,7 +202,7 @@ From CPA catalog entry → pi model:
 | CPA field | Pi field |
 | ----------- | ---------- |
 | `slug` | `id` |
-| `display_name` | `name` |
+| `display_name` | `name`, followed by [where the model comes from](#where-each-model-comes-from-in-its-name) when CLIProxyAPI says |
 | `context_window` | `contextWindow` |
 | `input_modalities` | `input` (`text` / `image`) |
 | `supported_reasoning_levels[].effort` | `thinkingLevelMap` + `reasoning` |
@@ -216,6 +216,37 @@ Unsupported pi thinking levels are set to `null` so they are hidden in the UI. W
 Models whose catalog entry sets `supports_reasoning_effort_updates` (GPT-6 on CLIProxyAPI) get pi's cache-preserving mid-session thinking level changes, matching the behavior pi >=1.3.0 ships for the OpenAI provider, with placement following the OpenAI documentation: the effort of the first turn becomes the fixed request-level `reasoning.effort`, and each later change is carried by a `configuration_update` input item placed immediately before the user message it applies to, so switching levels mid-session keeps the prompt prefix — and the upstream prompt cache — intact instead of rewriting it. WebSocket `previous_response_id` continuation also survives level changes. Histories lacking initial recorded levels (for example, sessions started before this support landed) may still need one full-context request while the baseline is being established. The behavior requires a pi >=1.3.0 host (its shared Responses converter); on older hosts the plugin detects the missing support and falls back to the classic request-level effort.
 
 The raw `models.dev` response is cached for 24 hours at `~/.pi/agent/tmp/models-dev-cache.json`. A fresh cache avoids the network request; an expired cache is refreshed with a three-second timeout, and stale data is retained if refresh fails. If neither the network nor a previous cache is available, pricing safely falls back to zero. A small explicit alias table covers known CLIProxyAPI variants such as `gemini-pro-agent` → `gemini-3.1-pro-preview`; unknown variants are not guessed.
+
+## Where each model comes from, in its name
+
+Through CLIProxyAPI pi sees one provider, so its model list does not say whether a model is served by a subscription
+login or by a paid API key, nor by whom. A CLIProxyAPI that lists its credentials
+([router-for-me/CLIProxyAPI#7634](https://github.com/router-for-me/CLIProxyAPI/pull/7634)) is asked for them with its
+plain model list (`GET /v1/models?include=accounts`, one request per model list refresh), and each model's name then
+ends with where it comes from:
+
+```
+Claude Opus 5.5 · Anthropic sub, fallback api
+Claude Sonnet 4.6 · Anthropic sub, fallback Antigravity sub
+anthropic/claude-opus-5.5 · OpenRouter api
+```
+
+- **`sub`** is a subscription login, **`api`** an API key.
+- **First** comes what CLIProxyAPI may answer with: the credentials at the highest priority, joined by `or` when they
+  differ (`Anthropic sub or api`). **After `fallback`** come the others, highest priority first: what may answer when
+  the first fail or cool down. A service is named again only when it changes.
+- **The service** is the one behind CLIProxyAPI's provider (`claude` is Anthropic, `codex` is OpenAI …). An API key
+  goes by the host CLIProxyAPI names for it (`openrouter.ai` is OpenRouter whatever the entry is called; a host that
+  is not known is shown as it is). A provider that is not known keeps CLIProxyAPI's name for it.
+- Everything is read from CLIProxyAPI's list; nothing is guessed from a model's id or owner. A CLIProxyAPI that does
+  not list its credentials, or a list that can't be read, leaves every name as it was.
+- It says what the list said when it was fetched: after changing credentials or priorities in CLIProxyAPI, run
+  `/cliproxyapi-refresh` (the startup refresh also updates it). It does not say which credential answered a given
+  request.
+
+pi shows a model's name in `/model` beside its id and searches it, and its model patterns (`--model`, scoped models)
+also match names: `openrouter` then matches every model that comes from OpenRouter, not only ids that contain the
+word.
 
 ## Migration from static models.json
 

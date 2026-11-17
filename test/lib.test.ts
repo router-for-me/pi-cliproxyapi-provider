@@ -70,6 +70,7 @@ describe("resolveEndpoints", () => {
 			inferenceBaseUrl: "http://127.0.0.1:8317/backend-api/",
 			modelsUrl: "http://127.0.0.1:8317/v1/models?client_version=pi",
 			rootOrigin: "http://127.0.0.1:8317",
+			plainModelsUrl: "http://127.0.0.1:8317/v1/models",
 		});
 	});
 

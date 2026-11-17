@@ -75,6 +75,11 @@ function writeConfig(agentDir: string, config: { baseUrl?: string; apiKey?: stri
 	writeFileSync(join(agentDir, CONFIG_FILE_NAME), JSON.stringify(config, null, 2), "utf8");
 }
 
+/** Requests beside the model catalog: models.dev prices and the list of credentials that serve each model. */
+function isSideRequest(input: unknown): boolean {
+	return /models\.dev|include=accounts/.test(String(input));
+}
+
 async function waitForAsyncRefresh(): Promise<void> {
 	for (let index = 0; index < 10; index++) {
 		await new Promise<void>((resolve) => setTimeout(resolve, 10));
@@ -200,7 +205,7 @@ describe("models request timeout wiring", () => {
 			await loadMappedModels("http://127.0.0.1:8317", "key");
 			expect(MODELS_REQUEST_TIMEOUT_MS).toBe(60_000);
 			expect(timeoutSpy).toHaveBeenCalledWith(MODELS_REQUEST_TIMEOUT_MS);
-			expect(timeoutSpy).toHaveBeenCalledTimes(1);
+			expect(timeoutSpy).toHaveBeenCalledTimes(2);
 			const requestInit = fetchMock.mock.calls[0]?.[1];
 			expect(requestInit).toBeDefined();
 			expect(requestInit).toHaveProperty("signal");
@@ -254,7 +259,7 @@ describe("resolveMappedModels cache behavior", () => {
 		saveModelsCache(agentDir, cached, Date.now());
 
 		const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-			if (String(input).includes("models.dev")) {
+			if (isSideRequest(input)) {
 				return new Response("{}", { status: 200 });
 			}
 			return new Response(JSON.stringify({ models: [createCodexModel("remote-fast")] }), { status: 200 });
@@ -262,7 +267,7 @@ describe("resolveMappedModels cache behavior", () => {
 
 		try {
 			const result = await resolveMappedModels(agentDir, "http://127.0.0.1:8317", "key", { fastMode: true });
-			expect(fetchMock).toHaveBeenCalledTimes(2);
+			expect(fetchMock).toHaveBeenCalledTimes(3);
 			expect(result.fromCache).toBe(false);
 			expect(result.loaded.models[0]?.id).toBe("remote-fast");
 			expect(loadModelsCache(agentDir, "http://127.0.0.1:8317")?.fastMode).toBe(true);
@@ -279,7 +284,7 @@ describe("resolveMappedModels cache behavior", () => {
 
 		try {
 			const result = await resolveMappedModels(agentDir, "http://127.0.0.1:8317", "key");
-			expect(fetchMock).toHaveBeenCalledTimes(1);
+			expect(fetchMock).toHaveBeenCalledTimes(2);
 			expect(result.fromCache).toBe(false);
 			expect(result.loaded.models.map((model) => model.id)).toEqual(["remote"]);
 			const diskCache = loadModelsCache(agentDir, "http://127.0.0.1:8317");
@@ -302,7 +307,7 @@ describe("resolveMappedModels cache behavior", () => {
 			const result = await resolveMappedModels(agentDir, "http://127.0.0.1:8317", "key", {
 				forceRefresh: true,
 			});
-			expect(fetchMock).toHaveBeenCalledTimes(1);
+			expect(fetchMock).toHaveBeenCalledTimes(2);
 			expect(result.fromCache).toBe(false);
 			expect(result.loaded.models[0].id).toBe("forced");
 		} finally {
@@ -338,7 +343,7 @@ describe("resolveMappedModels cache behavior", () => {
 			await expect(
 				resolveMappedModels(agentDir, "http://127.0.0.1:8317", "key", { forceRefresh: true }),
 			).rejects.toThrow("network down");
-			expect(fetchMock).toHaveBeenCalledTimes(1);
+			expect(fetchMock).toHaveBeenCalledTimes(2);
 		} finally {
 			fetchMock.mockRestore();
 		}
@@ -493,7 +498,7 @@ describe("provider startup cache behavior", () => {
 				releaseRemote = resolve;
 			});
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-				if (String(input).includes("models.dev")) {
+				if (isSideRequest(input)) {
 					return new Response("{}", { status: 200 });
 				}
 				return remoteResponse;
@@ -503,7 +508,7 @@ describe("provider startup cache behavior", () => {
 			try {
 				const startup = providerExtension(pi);
 				await waitForAsyncRefresh();
-				expect(fetchMock).toHaveBeenCalledTimes(2);
+				expect(fetchMock).toHaveBeenCalledTimes(3);
 				releaseRemote(
 					new Response(JSON.stringify({ models: [createCodexModel("startup-remote")] }), { status: 200 }),
 				);
@@ -528,7 +533,7 @@ describe("provider startup cache behavior", () => {
 				releaseRemote = resolve;
 			});
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-				if (String(input).includes("models.dev")) {
+				if (isSideRequest(input)) {
 					return new Response("{}", { status: 200 });
 				}
 				return remoteResponse;
@@ -537,7 +542,7 @@ describe("provider startup cache behavior", () => {
 
 			try {
 				await expect(providerExtension(pi)).resolves.toBeUndefined();
-				expect(fetchMock).toHaveBeenCalledTimes(2);
+				expect(fetchMock).toHaveBeenCalledTimes(3);
 				expect(commands.has("cliproxyapi-refresh")).toBe(true);
 
 				const initialCallsWithModels = (
@@ -581,7 +586,7 @@ describe("provider startup cache behavior", () => {
 			});
 			let modelRequestCount = 0;
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-				if (String(input).includes("models.dev")) {
+				if (isSideRequest(input)) {
 					return new Response("{}", { status: 200 });
 				}
 				modelRequestCount += 1;
@@ -629,7 +634,7 @@ describe("provider startup cache behavior", () => {
 			try {
 				await expect(providerExtension(pi)).resolves.toBeUndefined();
 				await waitForAsyncRefresh();
-				expect(fetchMock).toHaveBeenCalledTimes(2);
+				expect(fetchMock).toHaveBeenCalledTimes(3);
 				expect(warnMock).not.toHaveBeenCalledWith(expect.stringContaining("failed to refresh cached models"));
 
 				const callsWithModels = (
@@ -665,7 +670,7 @@ describe("provider startup cache behavior", () => {
 				releaseRemote = resolve;
 			});
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-				if (String(input).includes("models.dev")) {
+				if (isSideRequest(input)) {
 					return new Response("{}", { status: 200 });
 				}
 				return remoteResponse;
@@ -720,7 +725,7 @@ describe("provider startup cache behavior", () => {
 
 			// Remote returns immediately with only gpt-4o
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-				if (String(input).includes("models.dev")) {
+				if (isSideRequest(input)) {
 					return new Response("{}", { status: 200 });
 				}
 				return new Response(JSON.stringify({ models: [createCodexModel("gpt-4o")] }), { status: 200 });
@@ -763,7 +768,7 @@ describe("provider startup cache behavior", () => {
 			saveModelsCache(agentDir, cached, Date.now());
 
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-				if (String(input).includes("models.dev")) {
+				if (isSideRequest(input)) {
 					return new Response("{}", { status: 200 });
 				}
 				return new Response(JSON.stringify({ models: [createCodexModel("gpt-4o")] }), { status: 200 });
@@ -799,7 +804,7 @@ describe("provider startup cache behavior", () => {
 			saveModelsCache(agentDir, cached, Date.now());
 
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-				if (String(input).includes("models.dev")) {
+				if (isSideRequest(input)) {
 					return new Response("{}", { status: 200 });
 				}
 				// Remote drops stale-default-model, keeps active-model
@@ -833,7 +838,7 @@ describe("provider startup cache behavior", () => {
 			saveModelsCache(agentDir, cached, Date.now());
 
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-				if (String(input).includes("models.dev")) {
+				if (isSideRequest(input)) {
 					return new Response("{}", { status: 200 });
 				}
 				return new Response(JSON.stringify({ models: [createCodexModel("active-model")] }), { status: 200 });
@@ -870,7 +875,7 @@ describe("provider startup cache behavior", () => {
 				releaseRemote = resolve;
 			});
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-				if (String(input).includes("models.dev")) {
+				if (isSideRequest(input)) {
 					return new Response("{}", { status: 200 });
 				}
 				return remoteResponse;
@@ -906,7 +911,7 @@ describe("provider startup cache behavior", () => {
 
 			let fetchCount = 0;
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-				if (String(input).includes("models.dev")) {
+				if (isSideRequest(input)) {
 					return new Response("{}", { status: 200 });
 				}
 				fetchCount += 1;
@@ -963,7 +968,7 @@ describe("provider startup cache behavior", () => {
 
 			let fetchCount = 0;
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-				if (String(input).includes("models.dev")) {
+				if (isSideRequest(input)) {
 					return new Response("{}", { status: 200 });
 				}
 				fetchCount += 1;
@@ -1020,7 +1025,7 @@ describe("provider startup cache behavior", () => {
 
 			let fetchCount = 0;
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-				if (String(input).includes("models.dev")) {
+				if (isSideRequest(input)) {
 					return new Response("{}", { status: 200 });
 				}
 				fetchCount += 1;
@@ -1085,7 +1090,7 @@ describe("provider startup cache behavior", () => {
 
 			let fetchCount = 0;
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-				if (String(input).includes("models.dev")) {
+				if (isSideRequest(input)) {
 					return new Response("{}", { status: 200 });
 				}
 				fetchCount += 1;
@@ -1195,7 +1200,7 @@ describe("/cliproxyapi-refresh command", () => {
 
 				await refresh.handler("", ctx);
 
-				expect(fetchMock).toHaveBeenCalledTimes(4);
+				expect(fetchMock).toHaveBeenCalledTimes(6);
 				expect(notify).toHaveBeenCalledWith(expect.stringContaining("Refreshed 1 CLIProxyAPI models"), "info");
 
 				const diskCache = loadModelsCache(agentDir, "http://127.0.0.1:8317");
@@ -1249,7 +1254,7 @@ describe("/cliproxyapi-refresh command", () => {
 
 			let fetchCount = 0;
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-				if (String(input).includes("models.dev")) {
+				if (isSideRequest(input)) {
 					return new Response("{}", { status: 200 });
 				}
 				fetchCount += 1;
@@ -1309,7 +1314,7 @@ describe("/cliproxyapi-refresh command", () => {
 
 			let fetchCount = 0;
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-				if (String(input).includes("models.dev")) {
+				if (isSideRequest(input)) {
 					return new Response("{}", { status: 200 });
 				}
 				fetchCount += 1;
@@ -1424,7 +1429,7 @@ describe("/cliproxyapi-refresh command", () => {
 			});
 
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-				if (String(input).includes("models.dev")) {
+				if (isSideRequest(input)) {
 					return new Response("{}", { status: 200 });
 				}
 				fetchCount += 1;
@@ -1499,7 +1504,7 @@ describe("/cliproxyapi-refresh command", () => {
 
 			let fetchCount = 0;
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-				if (String(input).includes("models.dev")) {
+				if (isSideRequest(input)) {
 					return new Response("{}", { status: 200 });
 				}
 				fetchCount += 1;
@@ -1553,7 +1558,7 @@ describe("/cliproxyapi-refresh command", () => {
 			});
 
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-				if (String(input).includes("models.dev")) {
+				if (isSideRequest(input)) {
 					return new Response("{}", { status: 200 });
 				}
 				fetchCount += 1;
@@ -1637,7 +1642,7 @@ describe("/cliproxyapi-refresh command", () => {
 			});
 
 			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-				if (String(input).includes("models.dev")) {
+				if (isSideRequest(input)) {
 					return new Response("{}", { status: 200 });
 				}
 				fetchCount += 1;

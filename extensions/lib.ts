@@ -6,6 +6,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { readStoredCredential } from "@earendil-works/pi-coding-agent";
+import { type Account, parseAccounts, sourceLabel } from "./sources.ts";
 
 // Local shape matching pi ThinkingLevelMap; avoid hard runtime peer imports here.
 export type ThinkingLevelMap = Partial<
@@ -194,6 +195,8 @@ export function resolveEndpoints(baseUrlInput: string): {
 	inferenceBaseUrl: string;
 	modelsUrl: string;
 	rootOrigin: string;
+	/** Plain OpenAI model list. */
+	plainModelsUrl: string;
 } {
 	let raw = baseUrlInput.trim();
 	if (!raw) {
@@ -225,6 +228,7 @@ export function resolveEndpoints(baseUrlInput: string): {
 		inferenceBaseUrl,
 		modelsUrl,
 		rootOrigin: url.origin,
+		plainModelsUrl: `${url.origin}${modelsPath}`,
 	};
 }
 
@@ -528,11 +532,14 @@ export function toPiModel(
 	model: CodexClientModel,
 	costCatalog?: ModelsDevCostCatalog,
 	fastMode = false,
+	/** Where the model comes from ("Anthropic sub, fallback api"), added to its name. */
+	source?: string,
 ): PiProviderModel | null {
 	const id = codexModelId(model);
 	if (!id) {
 		return null;
 	}
+	const baseName = (model.display_name ?? model.name ?? id).trim() || id;
 	if (String(model.visibility ?? "").toLowerCase() === "hide") {
 		return null;
 	}
@@ -568,7 +575,7 @@ export function toPiModel(
 
 	return {
 		id,
-		name: (model.display_name ?? model.name ?? id).trim() || id,
+		name: source ? `${baseName} · ${source}` : baseName,
 		reasoning: hasReasoning,
 		input: buildInputModalities(model),
 		cost,
@@ -927,6 +934,37 @@ export function matchModelCost(modelId: string, costCatalog: ModelsDevCostCatalo
 	return cloneCost(isFastMode && entry.fast ? entry.fast : entry.standard);
 }
 
+/**
+ * Model id → the credentials that serve it, from CPA's plain OpenAI model list (`?include=accounts`). A CPA that does
+ * not list its credentials answers the plain list: no entries. Empty on any failure.
+ */
+export async function fetchModelAccounts(
+	plainModelsUrl: string,
+	apiKey: string,
+	timeoutMs = MODELS_REQUEST_TIMEOUT_MS,
+	signal?: AbortSignal,
+): Promise<Map<string, Account[]>> {
+	const listed = new Map<string, Account[]>();
+	try {
+		const timeoutSignal = AbortSignal.timeout(timeoutMs);
+		const response = await fetch(`${plainModelsUrl}?include=accounts`, {
+			headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+			signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
+		});
+		if (!response.ok) return listed;
+		const data = asRecord(await response.json())?.data;
+		for (const item of Array.isArray(data) ? data : []) {
+			const record = asRecord(item);
+			const id = typeof record?.id === "string" ? record.id.trim() : "";
+			const accounts = parseAccounts(record?.accounts);
+			if (id && accounts.length > 0) listed.set(id, accounts);
+		}
+	} catch {
+		// Without the list no name says where a model comes from.
+	}
+	return listed;
+}
+
 export async function loadMappedModels(
 	baseUrlInput: string,
 	apiKey: string,
@@ -938,12 +976,15 @@ export async function loadMappedModels(
 	const effectiveFastMode = typeof timeoutOrFastMode === "boolean" ? timeoutOrFastMode : false;
 	const timeoutMs = typeof timeoutOrFastMode === "number" ? timeoutOrFastMode : MODELS_REQUEST_TIMEOUT_MS;
 	const endpoints = resolveEndpoints(baseUrlInput);
-	const [remoteModels, costCatalog] = await Promise.all([
+	const [remoteModels, costCatalog, accounts] = await Promise.all([
 		fetchCodexModels(endpoints.modelsUrl, apiKey, timeoutMs, signal),
 		pricingEnabled ? fetchModelsDevCostMap(agentDir, false, signal) : Promise.resolve(undefined),
+		fetchModelAccounts(endpoints.plainModelsUrl, apiKey, timeoutMs, signal),
 	]);
 	const models = remoteModels
-		.map((model) => toPiModel(model, costCatalog, effectiveFastMode))
+		.map((model) =>
+			toPiModel(model, costCatalog, effectiveFastMode, sourceLabel(accounts.get(codexModelId(model)) ?? [])),
+		)
 		.filter((model): model is PiProviderModel => model !== null);
 	const fastModelIds = Array.from(
 		new Set(
