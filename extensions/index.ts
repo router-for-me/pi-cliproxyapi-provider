@@ -56,11 +56,13 @@ import {
 	resolveIdentity,
 	resolveMappedModels,
 	resolvePauseDefault,
+	resolveTpsDefault,
 	saveConfigFile,
 } from "./lib.ts";
 import type { PauseController } from "./pause.ts";
 import { pauseController, waitForPauseToEnd } from "./pause.ts";
 import { registerTransientNetworkErrorRetry } from "./retry.ts";
+import registerTpsStatus from "./tps.ts";
 
 class ConfigPersistenceError extends Error {
 	constructor(cause: unknown) {
@@ -771,6 +773,16 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const agentDir = getAgentDir();
 	const identity = resolveIdentity(agentDir);
 	const defaultBaseUrl = resolveDefaultBaseUrl(agentDir, identity.providerId);
+
+	// The elapsed/TPS footer ships inside this entry point so pi lists the package once.
+	let tpsEnabled = true;
+	try {
+		tpsEnabled = resolveTpsDefault(agentDir);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		logWarn(`invalid TPS configuration (${message}); using tps=true`);
+	}
+	if (tpsEnabled) registerTpsStatus(pi);
 
 	let pauseEnabled = false;
 	try {

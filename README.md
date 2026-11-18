@@ -100,6 +100,7 @@ Optional fields:
 | `providerName` | `CLIProxyAPI` | Display name in `/login` and UI |
 | `fast` | `false` | Persisted Fast mode preference; only applies to catalog-supported models |
 | `pause` | `false` | Persisted request-pause preference; provider requests wait until it is cleared |
+| `tps` | `true` | Show the elapsed time footer and TPS summary in the TUI; see [Elapsed time and TPS](#elapsed-time-and-tps-tui) |
 
 ### Environment overrides
 
@@ -227,13 +228,13 @@ If you previously maintained a static provider such as `cpa-responses` in `~/.pi
 
 ## Elapsed time and TPS (TUI)
 
-The package also registers `extensions/tps.ts`, which only activates for the primary interactive TUI session (`ctx.hasUI && ctx.mode === "tui"`):
+The provider extension also loads `extensions/tps.ts` (so pi lists the package as a single extension), which only activates for the primary interactive TUI session (`ctx.hasUI && ctx.mode === "tui"`):
 
 - While the agent is running, the footer shows `Elapsed …` (updates every second).
 - When the agent settles, the footer keeps the final elapsed time and a notification reports approximate TPS plus token usage (`out` / `in` / cache r/w / total).
 - Subagent and print-mode sessions do not own the timer, clear the parent footer, or emit TPS toasts.
 
-Disable just this helper via `pi config` if you only want the CLIProxyAPI provider.
+Set `"tps": false` in `~/.pi/agent/cliproxyapi.json` to turn off just this helper (takes effect on the next start or `/reload`).
 
 ## Failure behavior
 

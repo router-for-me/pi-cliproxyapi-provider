@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { registerPauseCommands } from "../extensions/index.ts";
-import { loadConfigFile, resolvePauseDefault, saveConfigFile } from "../extensions/lib.ts";
+import { loadConfigFile, resolvePauseDefault, resolveTpsDefault, saveConfigFile } from "../extensions/lib.ts";
 import { PAUSE_POLL_INTERVAL_MS, PauseController, pauseController, waitForPauseToEnd } from "../extensions/pause.ts";
 import tpsExtension from "../extensions/tps.ts";
 
@@ -167,5 +167,16 @@ describe("Elapsed timer", () => {
 		expect(() => handlers.get("agent_end")?.({ messages: [] }, staleCtx)).not.toThrow();
 		expect(() => handlers.get("agent_settled")?.({}, staleCtx)).not.toThrow();
 		expect(setStatus).toHaveBeenLastCalledWith("tps", undefined);
+	});
+});
+
+describe("tps setting", () => {
+	it("defaults to on and honours a persisted boolean", () => {
+		const agentDir = tempAgentDir();
+		expect(resolveTpsDefault(agentDir)).toBe(true);
+		writeFileSync(join(agentDir, "cliproxyapi.json"), '{"tps":false}\n', "utf8");
+		expect(resolveTpsDefault(agentDir)).toBe(false);
+		writeFileSync(join(agentDir, "cliproxyapi.json"), '{"tps":"no"}\n', "utf8");
+		expect(() => resolveTpsDefault(agentDir)).toThrow(/"tps" must be a boolean/);
 	});
 });

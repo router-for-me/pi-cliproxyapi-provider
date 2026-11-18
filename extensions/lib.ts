@@ -43,6 +43,7 @@ export interface CliproxyConfigFile {
 	providerName?: string;
 	fast?: boolean;
 	pause?: boolean;
+	tps?: boolean;
 }
 
 export interface ResolvedIdentity {
@@ -416,6 +417,18 @@ export function resolveFastDefault(agentDir: string): boolean {
 		throw new Error(`${CONFIG_FILE_NAME} field "fast" must be a boolean`);
 	}
 	return file.fast;
+}
+
+/** Resolve whether the TUI elapsed/TPS helper runs, from cliproxyapi.json, defaulting to true. */
+export function resolveTpsDefault(agentDir: string): boolean {
+	const file = loadConfigFile(agentDir);
+	if (file.tps === undefined) {
+		return true;
+	}
+	if (typeof file.tps !== "boolean") {
+		throw new Error(`${CONFIG_FILE_NAME} field "tps" must be a boolean`);
+	}
+	return file.tps;
 }
 
 /** Resolve the request pause preference from cliproxyapi.json, defaulting to false. */
