@@ -10,7 +10,7 @@
  * 4. Final login step validates credentials via /v1/models?client_version=pi
  *    (HTTP 200 = success even if the catalog is empty; otherwise re-prompt).
  * 5. On success, models/credentials are saved and registered immediately.
- * 6. `/fast` globally controls catalog-driven priority service tier injection.
+ * 6. `/fast` and `/ultrafast` globally control catalog-driven service tier injection.
  *
  * Uses a patched openai-codex-responses implementation that does not require
  * extracting chatgpt_account_id from the API key (plain CPA keys work).
@@ -29,12 +29,12 @@ import type {
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { ProactiveCompactionController } from "./auto-compact.ts";
 import {
-	applyFastPayloadHook,
 	CLIPROXYAPI_CODEX_API,
 	type CliproxyCodexStreamSimple,
 	loadCliproxyCodexStreams,
+	wrapStreamForServiceTier,
 } from "./codex-stream.ts";
-import { FastModeController } from "./fast.ts";
+import { FastModeController, type FastPreference } from "./fast.ts";
 import { FastFooterController } from "./fast-footer.ts";
 import {
 	CONFIG_FILE_NAME,
@@ -310,7 +310,6 @@ async function configureAndRegister(options: {
 	streamSimple: CliproxyCodexStreamSimple;
 	fastMode: FastModeController;
 	refreshCoordinator: ModelRefreshCoordinator;
-	onFastModeChange?: (enabled: boolean, ctx: ExtensionContext) => Promise<void>;
 	onRefreshOutcome?: (loaded: MappedModels) => void;
 }): Promise<RefreshResult> {
 	const {
@@ -324,7 +323,6 @@ async function configureAndRegister(options: {
 		streamSimple,
 		fastMode,
 		refreshCoordinator,
-		onFastModeChange,
 		onRefreshOutcome,
 	} = options;
 
@@ -362,7 +360,6 @@ async function configureAndRegister(options: {
 		streamSimple,
 		fastMode,
 		refreshCoordinator,
-		onFastModeChange,
 		onRefreshOutcome,
 	});
 	fastMode.setSupportedModelIds(loaded.fastModelIds);
@@ -386,7 +383,6 @@ function createOAuthHandlers(options: {
 	streamSimple: CliproxyCodexStreamSimple;
 	fastMode: FastModeController;
 	refreshCoordinator: ModelRefreshCoordinator;
-	onFastModeChange?: (enabled: boolean, ctx: ExtensionContext) => Promise<void>;
 	onRefreshOutcome?: (loaded: MappedModels) => void;
 }) {
 	const {
@@ -398,7 +394,6 @@ function createOAuthHandlers(options: {
 		streamSimple,
 		fastMode,
 		refreshCoordinator,
-		onFastModeChange,
 		onRefreshOutcome,
 	} = options;
 
@@ -429,7 +424,6 @@ function createOAuthHandlers(options: {
 						streamSimple,
 						fastMode,
 						refreshCoordinator,
-						onFastModeChange,
 						onRefreshOutcome,
 					});
 
@@ -494,7 +488,6 @@ function registerProvider(
 		streamSimple: CliproxyCodexStreamSimple;
 		fastMode: FastModeController;
 		refreshCoordinator?: ModelRefreshCoordinator;
-		onFastModeChange?: (enabled: boolean, ctx: ExtensionContext) => Promise<void>;
 		onRefreshOutcome?: (loaded: MappedModels) => void;
 	},
 ): void {
@@ -508,7 +501,6 @@ function registerProvider(
 		agentDir,
 		streamSimple,
 		fastMode,
-		onFastModeChange,
 		onRefreshOutcome,
 	} = options;
 	const refreshCoordinator = options.refreshCoordinator ?? new ModelRefreshCoordinator();
@@ -523,7 +515,6 @@ function registerProvider(
 		streamSimple,
 		fastMode,
 		refreshCoordinator,
-		onFastModeChange,
 		onRefreshOutcome,
 	});
 
@@ -593,22 +584,22 @@ export function registerPauseGuard(options: { pi: ExtensionAPI; agentDir: string
 	});
 }
 
-export function registerFastCommand(options: {
+export function registerFastCommands(options: {
 	pi: ExtensionAPI;
 	agentDir: string;
 	providerId: string;
 	fastMode: FastModeController;
 	onStatusChange?: (ctx: ExtensionContext) => void;
-	onModeChange?: (enabled: boolean, ctx: ExtensionContext) => Promise<void>;
+	onModeChange?: (ctx: ExtensionContext) => Promise<void>;
 }): void {
 	const { pi, agentDir, providerId, fastMode, onStatusChange, onModeChange } = options;
 	let modeChangeInProgress = false;
 
-	pi.registerCommand("fast", {
-		description: "Toggle CLIProxyAPI Fast mode globally.",
-		handler: async (args, ctx) => {
+	const createCommand = (name: string, label: string, selected: Exclude<FastPreference, false>) => ({
+		description: `Toggle CLIProxyAPI ${label} mode globally.`,
+		handler: async (args: string, ctx: ExtensionContext) => {
 			if (args.trim()) {
-				ctx.ui.notify("Usage: /fast", "error");
+				ctx.ui.notify(`Usage: /${name}`, "error");
 				return;
 			}
 			if (modeChangeInProgress) {
@@ -618,32 +609,33 @@ export function registerFastCommand(options: {
 
 			modeChangeInProgress = true;
 			try {
-				const previousEnabled = fastMode.isEnabled();
-				const enabled = !previousEnabled;
+				const previousPreference = fastMode.getPreference();
+				const preference = previousPreference === selected ? false : selected;
+				let previousSavedPreference: FastPreference | undefined;
 				try {
-					saveConfigFile(agentDir, { fast: enabled });
+					previousSavedPreference = saveConfigFile(agentDir, { fast: preference }).fast;
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
-					ctx.ui.notify(`Failed to save Fast mode: ${message}`, "error");
+					ctx.ui.notify(`Failed to save ${label} mode: ${message}`, "error");
 					return;
 				}
-				fastMode.setEnabled(enabled);
+				fastMode.setPreference(preference);
 				try {
-					await onModeChange?.(enabled, ctx);
+					await onModeChange?.(ctx);
 				} catch (error) {
 					// Restore all three views of the mode after a partial refresh:
 					// in-memory request behavior, persisted preference, and model metadata.
-					fastMode.setEnabled(previousEnabled);
+					fastMode.setPreference(previousPreference);
 					const rollbackErrors: string[] = [];
 					try {
-						saveConfigFile(agentDir, { fast: previousEnabled });
+						saveConfigFile(agentDir, { fast: previousSavedPreference });
 					} catch (rollbackError) {
 						rollbackErrors.push(
 							`config rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
 						);
 					}
 					try {
-						await onModeChange?.(previousEnabled, ctx);
+						await onModeChange?.(ctx);
 					} catch (rollbackError) {
 						rollbackErrors.push(
 							`pricing rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
@@ -659,10 +651,13 @@ export function registerFastCommand(options: {
 
 				const currentModel = ctx.model;
 				if (!currentModel || currentModel.provider !== providerId || !fastMode.isModelSupported(currentModel.id)) {
-					if (enabled) {
-						ctx.ui.notify("Fast mode is enabled globally, but the current model does not support it.", "warning");
+					if (preference !== false) {
+						ctx.ui.notify(
+							`${label} mode is enabled globally, but the current model does not support it.`,
+							"warning",
+						);
 					} else {
-						ctx.ui.notify("Fast mode is disabled globally.", "info");
+						ctx.ui.notify(`${label} mode is disabled globally.`, "info");
 					}
 				}
 			} finally {
@@ -670,6 +665,8 @@ export function registerFastCommand(options: {
 			}
 		},
 	});
+	pi.registerCommand("fast", createCommand("fast", "Fast", true));
+	pi.registerCommand("ultrafast", createCommand("ultrafast", "Ultra Fast", "ultrafast"));
 }
 
 export function registerRefreshCommand(options: {
@@ -786,14 +783,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const proactiveCompaction = new ProactiveCompactionController(agentDir, identity.providerId);
 	proactiveCompaction.register(pi);
 
-	let fastEnabled = false;
+	let fastPreference: FastPreference = false;
 	try {
-		fastEnabled = resolveFastDefault(agentDir);
+		fastPreference = resolveFastDefault(agentDir);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		logWarn(`invalid Fast configuration (${message}); using fast=false`);
 	}
-	const fastMode = new FastModeController(fastEnabled);
+	const fastMode = new FastModeController(fastPreference);
 	const modelRefreshCoordinator = new ModelRefreshCoordinator();
 
 	let streamLoadError: string | undefined;
@@ -805,7 +802,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	};
 	try {
 		const streams = await loadCliproxyCodexStreams([identity.providerId, "cliproxyapi"], {
-			shouldUseFast: (model) => model.provider === identity.providerId && fastMode.isEffectiveFor(model.id),
+			resolveServiceTier: (model) =>
+				model.provider === identity.providerId ? fastMode.getServiceTierFor(model.id) : undefined,
 		});
 		proactiveCompaction.setCloseWebSocketSessions(streams.closeOpenAICodexWebSocketSessions);
 		streamSimple = proactiveCompaction.wrapStreamSimple(streams.streamSimple);
@@ -834,46 +832,35 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 			coordinator.stack.push(entry);
 
-			const dispatchStream: CliproxyCodexStreamSimple = (model, context, options) => {
-				const active = findActiveCompatEntry(coordinator.stack, model.provider);
-				if (!active) {
-					throw new Error(
-						`No active provider stream handler registered for provider: ${model.provider} (api: ${CLIPROXYAPI_CODEX_API})`,
-					);
-				}
-				const shouldFast = (options as any)?.serviceTier === "priority" || (options as any)?.fast === true;
-				if (shouldFast) {
-					return active.rawStream(model, context, {
-						...options,
-						onPayload: (payload, payloadModel) => applyFastPayloadHook(payload, payloadModel, options?.onPayload),
-					});
-				}
-				return active.rawStream(model, context, options);
-			};
-
-			const dispatchStreamSimple: CliproxyCodexStreamSimple = (model, context, options) => {
-				const active = findActiveCompatEntry(coordinator.stack, model.provider);
-				if (!active) {
-					throw new Error(
-						`No active provider streamSimple handler registered for provider: ${model.provider} (api: ${CLIPROXYAPI_CODEX_API})`,
-					);
-				}
-				const shouldFast = (options as any)?.serviceTier === "priority" || (options as any)?.fast === true;
-				if (shouldFast) {
-					return active.rawStreamSimple(model, context, {
-						...options,
-						onPayload: (payload, payloadModel) => applyFastPayloadHook(payload, payloadModel, options?.onPayload),
-					});
-				}
-				return active.rawStreamSimple(model, context, options);
-			};
+			// Compat calls use only per-request options, never the foreground speed preference.
+			const createCompatDispatch = (method: "stream" | "streamSimple") =>
+				wrapStreamForServiceTier(
+					(model, context, options) => {
+						const active = findActiveCompatEntry(coordinator.stack, model.provider);
+						if (!active) {
+							throw new Error(
+								`No active provider ${method} handler registered for provider: ${model.provider} (api: ${CLIPROXYAPI_CODEX_API})`,
+							);
+						}
+						return active[method === "stream" ? "rawStream" : "rawStreamSimple"](model, context, options);
+					},
+					(_model, options) => {
+						const explicit = options as { serviceTier?: string; fast?: boolean } | undefined;
+						const tier = explicit?.serviceTier;
+						if (tier === "ultrafast" || tier === "priority") return tier;
+						return explicit?.fast === true ? "priority" : undefined;
+					},
+				);
 
 			unregisterApiProviders(COMPAT_SOURCE_ID);
 			registerApiProvider(
 				{
 					api: CLIPROXYAPI_CODEX_API,
-					stream: dispatchStream as StreamFunction<typeof CLIPROXYAPI_CODEX_API>,
-					streamSimple: dispatchStreamSimple as StreamFunction<typeof CLIPROXYAPI_CODEX_API, SimpleStreamOptions>,
+					stream: createCompatDispatch("stream") as StreamFunction<typeof CLIPROXYAPI_CODEX_API>,
+					streamSimple: createCompatDispatch("streamSimple") as StreamFunction<
+						typeof CLIPROXYAPI_CODEX_API,
+						SimpleStreamOptions
+					>,
 				},
 				COMPAT_SOURCE_ID,
 			);
@@ -901,16 +888,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		proactiveCompaction.getCompactionSettings(),
 	);
 	let refreshModelsForFast: ((ctx: ExtensionContext) => Promise<void>) | undefined;
-	const onFastModeChange = async (_enabled: boolean, ctx: ExtensionContext): Promise<void> => {
-		await refreshModelsForFast?.(ctx);
-	};
-	registerFastCommand({
+	registerFastCommands({
 		pi,
 		agentDir,
 		providerId: identity.providerId,
 		fastMode,
 		onStatusChange: (ctx) => fastFooter.refresh(ctx),
-		onModeChange: onFastModeChange,
+		onModeChange: async (ctx) => {
+			await refreshModelsForFast?.(ctx);
+		},
 	});
 	fastFooter.register(pi);
 
@@ -950,7 +936,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		streamSimple,
 		fastMode,
 		refreshCoordinator: modelRefreshCoordinator,
-		onFastModeChange: onFastModeChange,
 		onRefreshOutcome: handleRefreshOutcome,
 	});
 	registerTransientNetworkErrorRetry(pi, identity.providerId);
@@ -1039,7 +1024,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				streamSimple,
 				fastMode,
 				refreshCoordinator: modelRefreshCoordinator,
-				onFastModeChange,
 				onRefreshOutcome: handleRefreshOutcome,
 			});
 

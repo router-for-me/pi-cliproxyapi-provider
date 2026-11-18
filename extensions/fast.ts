@@ -1,11 +1,18 @@
-/** Global Fast preference plus the capability set advertised by CPA. */
+export type FastPreference = boolean | "ultrafast";
+export type FastServiceTier = "priority" | "ultrafast";
+
+/** Global speed preference plus the capability set advertised by CPA. */
 export class FastModeController {
 	private supportedModelIds = new Set<string>();
 
-	constructor(private enabled: boolean) {}
+	constructor(private preference: FastPreference) {}
 
-	setEnabled(enabled: boolean): void {
-		this.enabled = enabled;
+	getPreference(): FastPreference {
+		return this.preference;
+	}
+
+	setPreference(preference: FastPreference): void {
+		this.preference = preference;
 	}
 
 	setSupportedModelIds(modelIds: Iterable<string>): void {
@@ -15,14 +22,15 @@ export class FastModeController {
 	}
 
 	isEnabled(): boolean {
-		return this.enabled;
+		return this.preference !== false;
 	}
 
 	isModelSupported(modelId: string): boolean {
 		return this.supportedModelIds.has(modelId.trim());
 	}
 
-	isEffectiveFor(modelId: string): boolean {
-		return this.enabled && this.isModelSupported(modelId);
+	getServiceTierFor(modelId: string): FastServiceTier | undefined {
+		if (!this.isEnabled() || !this.isModelSupported(modelId)) return undefined;
+		return this.preference === "ultrafast" ? "ultrafast" : "priority";
 	}
 }

@@ -1,15 +1,15 @@
 # pi-cliproxyapi-provider
 
-Pi provider extension that discovers models from [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) and registers them for use in pi. It supports catalog-driven OpenAI Fast mode and also ships a small TUI helper that shows elapsed runtime and a TPS summary after each agent turn.
+Pi provider extension that discovers models from [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) and registers them for use in pi. It supports catalog-driven Fast and Ultra Fast modes and also ships a small TUI helper that shows elapsed runtime and a TPS summary after each agent turn.
 
 ## What it does
 
 1. Registers a provider that always appears in `/login` (account sign-in path).
 2. Interactive setup collects `baseUrl` + `apiKey` via `/login CLIProxyAPI` or `/login cliproxyapi`.
 3. Fetches `{root}/v1/models?client_version=pi`.
-4. Maps the CLIProxyAPI catalog into pi models, including Fast service-tier capability.
+4. Maps the CLIProxyAPI catalog into pi models, including support for faster service tiers.
 5. Registers inference against `{root}/backend-api/`.
-6. Provides `/fast` to toggle OpenAI priority processing for supported models.
+6. Provides `/fast` and `/ultrafast` to select faster service tiers for supported models.
 7. Caches the model catalog in `~/.pi/agent/cliproxyapi-models.json`, refreshes it in the background on startup, and provides `/cliproxyapi-refresh` to force a refresh.
 8. In interactive TUI sessions, shows footer elapsed time during runs and a TPS / token usage toast when the agent settles.
 9. After compaction, closes the reused Codex WebSocket for that session so CLIProxyAPI's server-side context resets with the compacted client messages.
@@ -98,7 +98,7 @@ Optional fields:
 | `apiKey` | _(required unless set via /login or env)_ | Bearer token / CPA API key |
 | `providerId` | `cliproxyapi` | Provider id shown in `/model` |
 | `providerName` | `CLIProxyAPI` | Display name in `/login` and UI |
-| `fast` | `false` | Persisted Fast mode preference; only applies to catalog-supported models |
+| `fast` | `false` | Persisted speed preference: `false` (off), `true` (Fast), or `"ultrafast"` (Ultra Fast) |
 | `pause` | `false` | Persisted request-pause preference; provider requests wait until it is cleared |
 
 ### Environment overrides
@@ -118,7 +118,7 @@ Resolution order for connection settings:
 3. `/login` credentials in `auth.json`
 4. Default baseUrl `http://127.0.0.1:8317`
 
-The Fast preference resolves separately as `CLIPROXYAPI_FAST` → `cliproxyapi.json` → `false`.
+At startup, `CLIPROXYAPI_FAST` overrides the persisted speed preference: a true value selects Fast, and a false value turns both modes off. The variable does not accept `ultrafast`. If unset, the provider uses `fast` from `cliproxyapi.json`, or defaults to off.
 
 ### baseUrl normalization
 
@@ -133,21 +133,20 @@ Preferred form is **host:port only**:
 
 pi then sends inference traffic to `{inference}/codex/responses`.
 
-## Fast mode
+## Fast and Ultra Fast modes
 
-OpenAI Fast mode requests the priority service tier. It can reduce latency for supported models, but consumes more OpenAI/Codex credits or incurs priority-processing pricing.
+Both modes are **off by default**. They request faster processing for supported models and may use more credits or incur higher costs.
 
-Fast is **off by default**. Toggle the global preference with:
+| Command | Model status label | Request field |
+| ------- | ------------------ | ------------- |
+| `/fast` | `fast` | `service_tier: "priority"` |
+| `/ultrafast` | `Ultra Fast` | `service_tier: "ultrafast"` |
 
-```text
-/fast
-```
+The modes are mutually exclusive. Run the active command again to turn it off, or run the other command to switch directly. Each change saves the global preference in `~/.pi/agent/cliproxyapi.json` and refreshes the provider's model pricing. The saved preference is restored at the next startup unless `CLIPROXYAPI_FAST` overrides it.
 
-Each invocation switches Fast between on and off and writes the result to `~/.pi/agent/cliproxyapi.json`. On the next startup, a persisted `true` value immediately enables Fast for catalog-supported models. Fast remains ineffective for unsupported models, so their requests are left unchanged. If `CLIPROXYAPI_FAST` is set, that environment variable still takes precedence on startup.
+Both modes apply only to models whose CLIProxyAPI catalog entry has a non-empty `service_tiers` array. The provider ignores `additional_speed_tiers`. When a mode is effective, pi appends its yellow label to the bottom-right model status without a separate notification. On unsupported models, the commands still update the global preference and warn when enabling a mode, but the request and model status remain unchanged.
 
-When Fast is effective, pi's model status appends a yellow lowercase `fast`, for example `gpt-5.6-sol • xhigh • fast`. When Fast is off or the selected model is unsupported, the original model status remains unchanged. Supported models do not produce a separate status notification. Running `/fast` with an unsupported model still updates the global preference; enabling it warns that the current model cannot use Fast.
-
-Fast capability is catalog-driven: the plugin considers a CLIProxyAPI model Fast-capable when its `service_tiers` field is a non-empty array. The `additional_speed_tiers` field is ignored. For supported models, Fast injects `service_tier: "priority"`; unsupported models are left unchanged. Fast is independent from pi's reasoning/thinking level. When `models.dev` provides `experimental.modes.fast.cost`, the registered model cost switches to those Fast rates as well; the provider is refreshed when `/fast` is toggled. If no Fast price is published, the standard price is retained. The plugin does not guess Fast prices from `-pro`/`-fast` model IDs.
+Both modes are independent of pi's reasoning level and use `experimental.modes.fast.cost` from `models.dev` when available. Otherwise, the registered model uses the standard price; the plugin does not guess prices from `-pro` or `-fast` model IDs.
 
 ## Pausing provider requests
 
@@ -250,5 +249,5 @@ Disable just this helper via `pi config` if you only want the CLIProxyAPI provid
   - HTTP 200 (including empty catalog) → credentials are persisted
   - non-200 / network / invalid baseUrl → nothing is persisted; re-enter baseUrl + API key
 - If CPA returns HTTP 200 with zero usable models: login still succeeds; re-run `/login CLIProxyAPI` later after models become available.
-- If the selected model does not provide a non-empty `service_tiers` array: the request is left unchanged; `/fast` still updates the global preference and warns when enabling it.
+- If the selected model does not provide a non-empty `service_tiers` array: the request is left unchanged; `/fast` and `/ultrafast` still update the global preference and warn when enabling a mode.
 - After `/compact`, threshold compaction, or overflow recovery, the provider closes the reused Codex WebSocket for the current session. CLIProxyAPI binds server-side context to the connection, so a reused socket would keep reporting a near-full `cacheRead` and retrigger proactive compaction even though the client context is now small. SSE is unaffected because it bills from the request body.

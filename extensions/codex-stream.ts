@@ -21,6 +21,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Api, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { getPackageDir } from "@earendil-works/pi-coding-agent";
+import type { FastServiceTier } from "./fast.ts";
 
 export const CLIPROXYAPI_CODEX_API = "cliproxyapi-codex-responses" as const;
 
@@ -42,7 +43,7 @@ export type CliproxyCodexStreams = {
 };
 
 export interface CliproxyCodexStreamOptions {
-	shouldUseFast?: (model: Model<Api>) => boolean;
+	resolveServiceTier?: (model: Model<Api>) => FastServiceTier | undefined;
 }
 
 type PayloadHook = NonNullable<SimpleStreamOptions["onPayload"]>;
@@ -248,38 +249,39 @@ function moveGptInstructionsToInput(
 	};
 }
 
-export function withPriorityServiceTier(payload: unknown): unknown {
+export function withServiceTier(payload: unknown, tier: FastServiceTier): unknown {
 	if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
 		return payload;
 	}
 	return {
 		...(payload as Record<string, unknown>),
-		service_tier: "priority",
+		service_tier: tier,
 	};
 }
 
-/** Apply Fast before pi's shared payload hooks so later extensions retain final control. */
-export async function applyFastPayloadHook(
+/** Apply the tier before pi's shared payload hooks so later extensions retain final control. */
+export async function applyServiceTierPayloadHook(
 	payload: unknown,
 	model: Model<Api>,
+	tier: FastServiceTier,
 	onPayload?: PayloadHook,
 ): Promise<unknown> {
-	const fastPayload = withPriorityServiceTier(payload);
-	const nextPayload = await onPayload?.(fastPayload, model);
-	return nextPayload === undefined ? fastPayload : nextPayload;
+	const tierPayload = withServiceTier(payload, tier);
+	const nextPayload = await onPayload?.(tierPayload, model);
+	return nextPayload === undefined ? tierPayload : nextPayload;
 }
 
-export function wrapStreamSimpleForFast(
-	streamSimple: CliproxyCodexStreamSimple,
-	shouldUseFast?: (model: Model<Api>) => boolean,
+export function wrapStreamForServiceTier(
+	stream: CliproxyCodexStreamSimple,
+	resolveServiceTier?: (model: Model<Api>, options?: SimpleStreamOptions) => FastServiceTier | undefined,
 ): CliproxyCodexStreamSimple {
 	return (model, context, streamOptions) => {
-		if (!shouldUseFast?.(model)) {
-			return streamSimple(model, context, streamOptions);
-		}
-		return streamSimple(model, context, {
+		const tier = resolveServiceTier?.(model, streamOptions);
+		if (!tier) return stream(model, context, streamOptions);
+		return stream(model, context, {
 			...streamOptions,
-			onPayload: (payload, payloadModel) => applyFastPayloadHook(payload, payloadModel, streamOptions?.onPayload),
+			onPayload: (payload, payloadModel) =>
+				applyServiceTierPayloadHook(payload, payloadModel, tier, streamOptions?.onPayload),
 		});
 	};
 }
@@ -1493,8 +1495,8 @@ export async function loadCliproxyCodexStreams(
 		return mod.stream(adaptModel(model), adaptContext(context), adaptOptions(context, streamOptions));
 	};
 
-	const streamSimple = wrapStreamSimpleForFast(adaptedStreamSimple, options.shouldUseFast);
-	const stream = wrapStreamSimpleForFast(adaptedStream, options.shouldUseFast);
+	const streamSimple = wrapStreamForServiceTier(adaptedStreamSimple, options.resolveServiceTier);
+	const stream = wrapStreamForServiceTier(adaptedStream, options.resolveServiceTier);
 
 	return {
 		api: CLIPROXYAPI_CODEX_API,

@@ -1,7 +1,15 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import { zstdDecompressSync } from "node:zlib";
+import {
+	type Api,
+	type AssistantMessageEventStream,
+	type Model,
+	normalizeContext,
+	type SimpleStreamOptions,
+	type TranscriptContext,
+} from "@earendil-works/pi-ai";
 import { getApiProvider, stream, streamSimple, unregisterApiProviders } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -17,6 +25,7 @@ const CLIPROXYAPI_ENV_NAMES = [
 	"CLIPROXYAPI_FAST",
 	"CLIPROXYAPI_PROVIDER_ID",
 	"CLIPROXYAPI_PROVIDER_NAME",
+	"CLIPROXYAPI_TRANSPORT",
 ] as const;
 
 async function withTempAgentDir(run: (agentDir: string) => Promise<void>): Promise<void> {
@@ -86,7 +95,7 @@ describe("pi 0.82.0 compatibility", () => {
 		unregisterApiProviders(COMPAT_SOURCE_ID);
 	});
 
-	it("registers oauth login and /fast without a dedicated /cliproxyapi command", async () => {
+	it("registers oauth login and both speed commands without a dedicated /cliproxyapi command", async () => {
 		await withTempAgentDir(async () => {
 			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
 			const { pi } = createPiMock(commands);
@@ -101,8 +110,9 @@ describe("pi 0.82.0 compatibility", () => {
 				await expect(providerExtension(pi)).resolves.toBeUndefined();
 				expect(fetchMock).not.toHaveBeenCalled();
 
-				expect(commands.size).toBe(4);
+				expect(commands.size).toBe(5);
 				expect(commands.has("fast")).toBe(true);
+				expect(commands.has("ultrafast")).toBe(true);
 				expect(commands.has("pause")).toBe(true);
 				expect(commands.has("continue")).toBe(true);
 				expect(commands.has("cliproxyapi-refresh")).toBe(true);
@@ -125,7 +135,10 @@ describe("pi 0.82.0 compatibility", () => {
 		});
 	});
 
-	it("updates the active session model with Fast pricing after /fast", async () => {
+	it.each([
+		["fast", "priority"],
+		["ultrafast", "ultrafast"],
+	] as const)("applies Fast pricing and sends the foreground tier after /%s", async (name, tier) => {
 		await withTempAgentDir(async (agentDir) => {
 			writeFileSync(
 				join(agentDir, "cliproxyapi.json"),
@@ -158,7 +171,12 @@ describe("pi 0.82.0 compatibility", () => {
 					);
 				}
 				return new Response(
-					JSON.stringify({ models: [{ slug: "gpt-5.6-sol", service_tiers: [{ id: "priority" }] }] }),
+					JSON.stringify({
+						models: [
+							{ slug: "gpt-5.6-sol", service_tiers: [{ id: "flex" }] },
+							{ slug: "custom-model", service_tiers: [], additional_speed_tiers: ["FAST"] },
+						],
+					}),
 					{ status: 200, headers: { "Content-Type": "application/json" } },
 				);
 			});
@@ -167,8 +185,40 @@ describe("pi 0.82.0 compatibility", () => {
 				await providerExtension(pi);
 				const currentModel = registeredModels.get("cliproxyapi/gpt-5.6-sol");
 				expect(currentModel?.cost.input).toBe(5);
-				const command = commands.get("fast");
-				if (!command || !currentModel) throw new Error("Fast command or active model is unavailable");
+				const command = commands.get(name);
+				if (!command || !currentModel) throw new Error(`/${name} or active model is unavailable`);
+				const [, provider] = vi.mocked(pi.registerProvider).mock.calls.at(-1)!;
+				const foregroundStream = provider.streamSimple!;
+				const captureTier = async (
+					send: (
+						model: Model<Api>,
+						context: TranscriptContext,
+						options: SimpleStreamOptions & Record<string, unknown>,
+					) => AssistantMessageEventStream,
+					model: Model<Api>,
+					options: SimpleStreamOptions & { fast?: boolean; serviceTier?: string } = {},
+				) => {
+					const request = vi.fn<typeof fetch>(
+						async () =>
+							new Response(
+								'data: {"type":"response.completed","response":{"status":"completed","output":[]}}\n\n',
+								{ headers: { "Content-Type": "text/event-stream" } },
+							),
+					);
+					const result = await send(model, normalizeContext({ messages: [] }), {
+						apiKey: "stored-key",
+						transport: "sse",
+						fetch: request,
+						maxRetries: 0,
+						...options,
+					}).result();
+					expect(result.errorMessage).toBeUndefined();
+					expect(request).toHaveBeenCalledTimes(1);
+					const body = request.mock.calls[0][1]?.body;
+					const json = typeof body === "string" ? body : zstdDecompressSync(body as Uint8Array).toString("utf8");
+					return (JSON.parse(json) as Record<string, unknown>).service_tier;
+				};
+				expect(await captureTier(foregroundStream, currentModel)).toBeUndefined();
 
 				const ctx = {
 					model: currentModel,
@@ -185,8 +235,21 @@ describe("pi 0.82.0 compatibility", () => {
 					}),
 				);
 
-				const fastModel = (pi.setModel as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as Model<Api>;
+				const fastModel = vi.mocked(pi.setModel).mock.calls[0][0];
+				expect(await captureTier(foregroundStream, fastModel)).toBe(tier);
+				const unsupportedModel = registeredModels.get("cliproxyapi/custom-model")!;
+				expect(await captureTier(foregroundStream, unsupportedModel)).toBeUndefined();
+				for (const dispatch of [stream, streamSimple]) {
+					expect(await captureTier(dispatch, fastModel)).toBeUndefined();
+					expect(await captureTier(dispatch, fastModel, { fast: true })).toBe("priority");
+					expect(await captureTier(dispatch, fastModel, { serviceTier: "priority" })).toBe("priority");
+					expect(await captureTier(dispatch, fastModel, { serviceTier: "ultrafast", fast: true })).toBe(
+						"ultrafast",
+					);
+				}
+
 				await command.handler("", { ...ctx, model: fastModel });
+				expect(await captureTier(foregroundStream, fastModel)).toBeUndefined();
 				expect(pi.setModel).toHaveBeenLastCalledWith(
 					expect.objectContaining({
 						id: "gpt-5.6-sol",
@@ -232,8 +295,9 @@ describe("pi 0.82.0 compatibility", () => {
 			try {
 				await expect(providerExtension(pi)).resolves.toBeUndefined();
 				expect(fetchMock).toHaveBeenCalled();
-				expect(commands.size).toBe(4);
+				expect(commands.size).toBe(5);
 				expect(commands.has("fast")).toBe(true);
+				expect(commands.has("ultrafast")).toBe(true);
 				expect(commands.has("pause")).toBe(true);
 				expect(commands.has("continue")).toBe(true);
 				expect(commands.has("cliproxyapi-refresh")).toBe(true);
@@ -507,39 +571,6 @@ describe("pi 0.82.0 compatibility", () => {
 			}
 
 			expect(getApiProvider("cliproxyapi-codex-responses" as Api)).toBeUndefined();
-		});
-	});
-
-	it("isolates Fast mode in compat dispatch from mutable foreground instance toggles", async () => {
-		await withTempAgentDir(async (agentDir) => {
-			writeFileSync(
-				join(agentDir, "cliproxyapi.json"),
-				JSON.stringify({ baseUrl: "http://127.0.0.1:8317", apiKey: "stored-key" }),
-				"utf8",
-			);
-			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
-			const { pi } = createPiMock(commands);
-
-			await providerExtension(pi);
-
-			const testModel = {
-				id: "gpt-5.6-terra",
-				provider: "cliproxyapi",
-				api: "cliproxyapi-codex-responses" as Api,
-				baseUrl: "http://127.0.0.1:8317",
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			} as Model<Api>;
-
-			// Standard compat call without fast requested does not inject priority
-			const stream1 = streamSimple(testModel, { messages: [] }, { apiKey: "stored-key" });
-			expect(stream1).toBeDefined();
-
-			// Explicit fast request via serviceTier: "priority" works
-			const stream2 = streamSimple(testModel, { messages: [] }, {
-				apiKey: "stored-key",
-				serviceTier: "priority",
-			} as any);
-			expect(stream2).toBeDefined();
 		});
 	});
 

@@ -6,6 +6,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { readStoredCredential } from "@earendil-works/pi-coding-agent";
+import type { FastPreference } from "./fast.ts";
 
 // Local shape matching pi ThinkingLevelMap; avoid hard runtime peer imports here.
 export type ThinkingLevelMap = Partial<
@@ -41,7 +42,7 @@ export interface CliproxyConfigFile {
 	apiKey?: string;
 	providerId?: string;
 	providerName?: string;
-	fast?: boolean;
+	fast?: FastPreference;
 	pause?: boolean;
 }
 
@@ -312,7 +313,8 @@ export function isModelReferencedAsDefault(
 	return false;
 }
 
-export function saveConfigFile(agentDir: string, config: CliproxyConfigFile): void {
+/** Merge the config update and return the previous values for callers that need to roll back. */
+export function saveConfigFile(agentDir: string, config: CliproxyConfigFile): CliproxyConfigFile {
 	const configPath = join(agentDir, CONFIG_FILE_NAME);
 	mkdirSync(dirname(configPath), { recursive: true });
 
@@ -322,6 +324,7 @@ export function saveConfigFile(agentDir: string, config: CliproxyConfigFile): vo
 		...config,
 	};
 	writeFileSync(configPath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+	return existing;
 }
 
 export function loadModelsCache(agentDir: string, baseUrlInput: string): ModelsCacheFile | null {
@@ -397,8 +400,8 @@ export function parseBooleanSetting(value: string): boolean | undefined {
 	}
 }
 
-/** Resolve the Fast preference from env, then cliproxyapi.json, then false. */
-export function resolveFastDefault(agentDir: string): boolean {
+/** Resolve the speed preference from the boolean env override, then config, then false. */
+export function resolveFastDefault(agentDir: string): FastPreference {
 	const envValue = firstNonEmpty(process.env.CLIPROXYAPI_FAST);
 	if (envValue !== undefined) {
 		const parsed = parseBooleanSetting(envValue);
@@ -412,8 +415,8 @@ export function resolveFastDefault(agentDir: string): boolean {
 	if (file.fast === undefined) {
 		return false;
 	}
-	if (typeof file.fast !== "boolean") {
-		throw new Error(`${CONFIG_FILE_NAME} field "fast" must be a boolean`);
+	if (typeof file.fast !== "boolean" && file.fast !== "ultrafast") {
+		throw new Error(`${CONFIG_FILE_NAME} field "fast" must be a boolean or "ultrafast"`);
 	}
 	return file.fast;
 }

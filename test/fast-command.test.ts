@@ -4,26 +4,26 @@ import { join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { FastModeController } from "../extensions/fast.ts";
-import { registerFastCommand } from "../extensions/index.ts";
+import { FastModeController, type FastPreference } from "../extensions/fast.ts";
+import { registerFastCommands } from "../extensions/index.ts";
 import { loadConfigFile, resolveFastDefault, saveConfigFile } from "../extensions/lib.ts";
 
 function createCommandHarness(
 	fastMode: FastModeController,
 	currentModel: Model<Api>,
 	agentDir: string,
-	onModeChange?: (enabled: boolean, ctx: ExtensionContext) => Promise<void>,
+	onModeChange?: (ctx: ExtensionContext) => Promise<void>,
 ) {
-	let command: Parameters<ExtensionAPI["registerCommand"]>[1] | undefined;
+	const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
 	const onStatusChange = vi.fn();
 	const notify = vi.fn();
 	const pi = {
-		registerCommand: vi.fn((_name: string, options: Parameters<ExtensionAPI["registerCommand"]>[1]) => {
-			command = options;
+		registerCommand: vi.fn((name: string, options: Parameters<ExtensionAPI["registerCommand"]>[1]) => {
+			commands.set(name, options);
 		}),
 	} as unknown as ExtensionAPI;
 
-	registerFastCommand({ pi, agentDir, providerId: "cliproxyapi", fastMode, onStatusChange, onModeChange });
+	registerFastCommands({ pi, agentDir, providerId: "cliproxyapi", fastMode, onStatusChange, onModeChange });
 
 	const ctx = {
 		model: currentModel,
@@ -31,8 +31,9 @@ function createCommandHarness(
 	} as unknown as ExtensionCommandContext;
 
 	return {
-		command: () => {
-			if (!command) throw new Error("Fast command was not registered");
+		command: (name = "fast") => {
+			const command = commands.get(name);
+			if (!command) throw new Error(`/${name} was not registered`);
 			return command;
 		},
 		ctx,
@@ -61,7 +62,7 @@ afterEach(() => {
 	}
 });
 
-describe("/fast command", () => {
+describe("speed commands", () => {
 	it("toggles Fast and persists the preference in the global config", async () => {
 		const agentDir = tempAgentDir();
 		saveConfigFile(agentDir, { baseUrl: "http://localhost:8317" });
@@ -82,21 +83,46 @@ describe("/fast command", () => {
 		expect(harness.notify).not.toHaveBeenCalled();
 	});
 
-	it("restores persisted Fast only for supported models after restart", async () => {
+	it("switches directly between Fast and Ultra Fast and turns the active mode off", async () => {
 		const agentDir = tempAgentDir();
 		const fastMode = new FastModeController(false);
 		fastMode.setSupportedModelIds([supportedModel.id]);
 		const harness = createCommandHarness(fastMode, supportedModel, agentDir);
 
-		await harness.command().handler("", harness.ctx);
+		for (const [name, preference] of [
+			["fast", true],
+			["ultrafast", "ultrafast"],
+			["fast", true],
+			["ultrafast", "ultrafast"],
+			["ultrafast", false],
+		] as const) {
+			await harness.command(name).handler("", harness.ctx);
+			expect(loadConfigFile(agentDir)).toEqual({ fast: preference });
+			expect(fastMode.getPreference()).toBe(preference);
+		}
+		expect(harness.notify).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		["fast", true],
+		["ultrafast", "ultrafast"],
+	] as const)("restores /%s only for supported models after restart", async (name, preference) => {
+		const agentDir = tempAgentDir();
+		const fastMode = new FastModeController(false);
+		fastMode.setSupportedModelIds([supportedModel.id]);
+		const harness = createCommandHarness(fastMode, supportedModel, agentDir);
+
+		await harness.command(name).handler("", harness.ctx);
 
 		const previousFastEnv = process.env.CLIPROXYAPI_FAST;
 		try {
 			delete process.env.CLIPROXYAPI_FAST;
-			const restartedMode = new FastModeController(resolveFastDefault(agentDir));
+			const restoredPreference = resolveFastDefault(agentDir);
+			expect(restoredPreference).toBe(preference);
+			const restartedMode = new FastModeController(restoredPreference);
 			restartedMode.setSupportedModelIds([supportedModel.id]);
-			expect(restartedMode.isEffectiveFor(supportedModel.id)).toBe(true);
-			expect(restartedMode.isEffectiveFor("unsupported-model")).toBe(false);
+			expect(restartedMode.getServiceTierFor(supportedModel.id)).toBe(preference === true ? "priority" : preference);
+			expect(restartedMode.getServiceTierFor("unsupported-model")).toBeUndefined();
 		} finally {
 			if (previousFastEnv === undefined) {
 				delete process.env.CLIPROXYAPI_FAST;
@@ -106,87 +132,157 @@ describe("/fast command", () => {
 		}
 	});
 
-	it("rejects arguments instead of using the old on, off, or status actions", async () => {
+	it.each(["fast", "ultrafast"])("rejects arguments to /%s", async (name) => {
 		const agentDir = tempAgentDir();
 		const fastMode = new FastModeController(false);
 		fastMode.setSupportedModelIds([supportedModel.id]);
 		const harness = createCommandHarness(fastMode, supportedModel, agentDir);
 
-		await harness.command().handler("on", harness.ctx);
+		await harness.command(name).handler("on", harness.ctx);
 
 		expect(fastMode.isEnabled()).toBe(false);
 		expect(loadConfigFile(agentDir)).toEqual({});
-		expect(harness.notify).toHaveBeenCalledWith("Usage: /fast", "error");
+		expect(harness.notify).toHaveBeenCalledWith(`Usage: /${name}`, "error");
 	});
 
-	it("updates the global preference while keeping Fast ineffective for an unsupported model", async () => {
+	it.each([
+		["fast", "Fast", true],
+		["ultrafast", "Ultra Fast", "ultrafast"],
+	] as const)("updates /%s globally while keeping it ineffective for an unsupported model", async (name, label, preference) => {
 		const agentDir = tempAgentDir();
 		const fastMode = new FastModeController(false);
 		const harness = createCommandHarness(fastMode, supportedModel, agentDir);
 
-		await harness.command().handler("", harness.ctx);
+		await harness.command(name).handler("", harness.ctx);
 
 		expect(fastMode.isEnabled()).toBe(true);
-		expect(fastMode.isEffectiveFor(supportedModel.id)).toBe(false);
-		expect(loadConfigFile(agentDir)).toEqual({ fast: true });
+		expect(fastMode.getServiceTierFor(supportedModel.id)).toBeUndefined();
+		expect(loadConfigFile(agentDir)).toEqual({ fast: preference });
 		expect(harness.onStatusChange).toHaveBeenCalledTimes(1);
 		expect(harness.notify).toHaveBeenLastCalledWith(
-			"Fast mode is enabled globally, but the current model does not support it.",
+			`${label} mode is enabled globally, but the current model does not support it.`,
 			"warning",
 		);
 
-		await harness.command().handler("", harness.ctx);
+		await harness.command(name).handler("", harness.ctx);
 
 		expect(fastMode.isEnabled()).toBe(false);
 		expect(loadConfigFile(agentDir)).toEqual({ fast: false });
 		expect(harness.onStatusChange).toHaveBeenCalledTimes(2);
-		expect(harness.notify).toHaveBeenLastCalledWith("Fast mode is disabled globally.", "info");
+		expect(harness.notify).toHaveBeenLastCalledWith(`${label} mode is disabled globally.`, "info");
 	});
 
-	it("rejects an overlapping toggle while pricing refresh is in progress", async () => {
+	it("shares the pricing refresh lock between /fast and /ultrafast", async () => {
 		const agentDir = tempAgentDir();
 		const fastMode = new FastModeController(false);
 		fastMode.setSupportedModelIds([supportedModel.id]);
 		let finishRefresh: (() => void) | undefined;
-		const onModeChange = vi.fn(
-			async () =>
-				await new Promise<void>((resolve) => {
-					finishRefresh = resolve;
-				}),
-		);
+		const pendingRefresh = new Promise<void>((resolve) => {
+			finishRefresh = resolve;
+		});
+		const onModeChange = vi.fn(async () => {}).mockReturnValueOnce(pendingRefresh);
 		const harness = createCommandHarness(fastMode, supportedModel, agentDir, onModeChange);
 
-		const firstToggle = harness.command().handler("", harness.ctx);
-		await vi.waitFor(() => expect(onModeChange).toHaveBeenCalledTimes(1));
-		await harness.command().handler("", harness.ctx);
+		const firstToggle = harness.command("ultrafast").handler("", harness.ctx);
+		try {
+			await vi.waitFor(() => expect(onModeChange).toHaveBeenCalledTimes(1));
+			await harness.command("fast").handler("", harness.ctx);
 
-		expect(fastMode.isEnabled()).toBe(true);
-		expect(loadConfigFile(agentDir)).toEqual({ fast: true });
-		expect(onModeChange).toHaveBeenCalledTimes(1);
-		expect(harness.notify).toHaveBeenCalledWith(
-			"Fast mode is already being refreshed. Try again when it finishes.",
-			"warning",
-		);
-
-		finishRefresh?.();
-		await firstToggle;
+			expect(loadConfigFile(agentDir)).toEqual({ fast: "ultrafast" });
+			expect(onModeChange).toHaveBeenCalledTimes(1);
+			expect(harness.notify).toHaveBeenCalledWith(
+				"Fast mode is already being refreshed. Try again when it finishes.",
+				"warning",
+			);
+		} finally {
+			finishRefresh?.();
+			await firstToggle;
+		}
 	});
 
 	it("restores state, config, and pricing metadata when refresh fails", async () => {
 		const agentDir = tempAgentDir();
 		const fastMode = new FastModeController(false);
 		fastMode.setSupportedModelIds([supportedModel.id]);
-		const onModeChange = vi.fn(async (enabled: boolean) => {
-			if (enabled) throw new Error("refresh failed");
-		});
+		const refreshPreferences: FastPreference[] = [];
+		const onModeChange = async () => {
+			const preference = fastMode.getPreference();
+			refreshPreferences.push(preference);
+			if (preference === true) throw new Error("refresh failed");
+		};
 		const harness = createCommandHarness(fastMode, supportedModel, agentDir, onModeChange);
 
 		await harness.command().handler("", harness.ctx);
 
 		expect(fastMode.isEnabled()).toBe(false);
-		expect(loadConfigFile(agentDir)).toEqual({ fast: false });
-		expect(onModeChange.mock.calls.map(([enabled]) => enabled)).toEqual([true, false]);
+		expect(loadConfigFile(agentDir)).toStrictEqual({});
+		expect(refreshPreferences).toEqual([true, false]);
 		expect(harness.notify).toHaveBeenCalledWith("Failed to refresh model pricing: refresh failed", "warning");
+	});
+
+	it("rolls back to Ultra Fast when switching to Fast fails to refresh pricing", async () => {
+		const agentDir = tempAgentDir();
+		const fastMode = new FastModeController(false);
+		fastMode.setSupportedModelIds([supportedModel.id]);
+		const refreshPreferences: FastPreference[] = [];
+		const onModeChange = async () => {
+			const preference = fastMode.getPreference();
+			refreshPreferences.push(preference);
+			if (preference === true) throw new Error("refresh failed");
+		};
+		const harness = createCommandHarness(fastMode, supportedModel, agentDir, onModeChange);
+		await harness.command("ultrafast").handler("", harness.ctx);
+
+		await harness.command("fast").handler("", harness.ctx);
+
+		expect(loadConfigFile(agentDir)).toEqual({ fast: "ultrafast" });
+		expect(fastMode.getServiceTierFor(supportedModel.id)).toBe("ultrafast");
+		expect(refreshPreferences).toEqual(["ultrafast", true, "ultrafast"]);
+		expect(harness.notify).toHaveBeenCalledWith("Failed to refresh model pricing: refresh failed", "warning");
+		await harness.command("ultrafast").handler("", harness.ctx);
+		expect(loadConfigFile(agentDir)).toEqual({ fast: false });
+	});
+
+	it("preserves the saved Ultra Fast preference on rollback when startup forced Fast", async () => {
+		const agentDir = tempAgentDir();
+		saveConfigFile(agentDir, { fast: "ultrafast" });
+		const fastMode = new FastModeController(true);
+		fastMode.setSupportedModelIds([supportedModel.id]);
+		const harness = createCommandHarness(fastMode, supportedModel, agentDir, async () => {
+			if (fastMode.getPreference() === "ultrafast") throw new Error("refresh failed");
+		});
+
+		await harness.command("ultrafast").handler("", harness.ctx);
+
+		expect(fastMode.getServiceTierFor(supportedModel.id)).toBe("priority");
+		expect(loadConfigFile(agentDir)).toEqual({ fast: "ultrafast" });
+		expect(harness.notify).toHaveBeenCalledWith("Failed to refresh model pricing: refresh failed", "warning");
+	});
+
+	it("does not persist a startup override when a switch to Ultra Fast fails", async () => {
+		const agentDir = tempAgentDir();
+		const config = { baseUrl: "http://localhost:8317", pause: true };
+		saveConfigFile(agentDir, config);
+
+		vi.stubEnv("CLIPROXYAPI_FAST", "on");
+		try {
+			const fastMode = new FastModeController(resolveFastDefault(agentDir));
+			fastMode.setSupportedModelIds([supportedModel.id]);
+			expect(fastMode.getServiceTierFor(supportedModel.id)).toBe("priority");
+			const harness = createCommandHarness(fastMode, supportedModel, agentDir, async () => {
+				if (fastMode.getPreference() === "ultrafast") throw new Error("refresh failed");
+			});
+
+			await harness.command("ultrafast").handler("", harness.ctx);
+
+			expect(harness.notify).toHaveBeenCalledWith("Failed to refresh model pricing: refresh failed", "warning");
+			expect(fastMode.getServiceTierFor(supportedModel.id)).toBe("priority");
+			expect(loadConfigFile(agentDir)).toStrictEqual(config);
+			vi.stubEnv("CLIPROXYAPI_FAST", undefined);
+			expect(resolveFastDefault(agentDir)).toBe(false);
+		} finally {
+			vi.unstubAllEnvs();
+		}
 	});
 
 	it("does not change in-memory state when the global config cannot be written", async () => {

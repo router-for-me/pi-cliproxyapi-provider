@@ -5,13 +5,13 @@ import type { Api, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, FooterComponent } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import {
-	applyFastPayloadHook,
+	applyServiceTierPayloadHook,
 	type CliproxyCodexStreamSimple,
 	loadCliproxyCodexStreams,
 	patchCodexSource,
 	resolveCodexModuleFromNodeEntry,
-	withPriorityServiceTier,
-	wrapStreamSimpleForFast,
+	withServiceTier,
+	wrapStreamForServiceTier,
 } from "../extensions/codex-stream.ts";
 import { FastModeController } from "../extensions/fast.ts";
 import { FastFooterController, formatFastModelStatus } from "../extensions/fast-footer.ts";
@@ -149,34 +149,34 @@ describe("FastModeController", () => {
 		expect(mode.isEnabled()).toBe(false);
 		expect(mode.isModelSupported("gpt-5.4")).toBe(true);
 		expect(mode.isModelSupported("gpt-5.5")).toBe(true);
-		expect(mode.isEffectiveFor("gpt-5.4")).toBe(false);
-		expect(mode.isEffectiveFor("custom-model")).toBe(false);
+		expect(mode.getServiceTierFor("gpt-5.4")).toBeUndefined();
+		expect(mode.getServiceTierFor("custom-model")).toBeUndefined();
 
-		mode.setEnabled(true);
-		expect(mode.isEffectiveFor("gpt-5.4")).toBe(true);
-		expect(mode.isEffectiveFor("custom-model")).toBe(false);
+		mode.setPreference(true);
+		expect(mode.getServiceTierFor("gpt-5.4")).toBe("priority");
+		expect(mode.getServiceTierFor("custom-model")).toBeUndefined();
 
-		mode.setEnabled(false);
-		expect(mode.isEffectiveFor("gpt-5.4")).toBe(false);
+		mode.setPreference(false);
+		expect(mode.getServiceTierFor("gpt-5.4")).toBeUndefined();
 	});
 
 	it("updates the global preference", () => {
 		const mode = new FastModeController(false);
 
-		mode.setEnabled(true);
+		mode.setPreference(true);
 		expect(mode.isEnabled()).toBe(true);
-		mode.setEnabled(false);
+		mode.setPreference(false);
 		expect(mode.isEnabled()).toBe(false);
 	});
 });
 
 describe("Fast footer model status", () => {
 	it("appends Fast and paused labels at the right side of model status", () => {
-		expect(formatFastModelStatus("gpt-5.6-sol", true, "xhigh", true)).toBe("gpt-5.6-sol • xhigh • fast");
-		expect(formatFastModelStatus("gpt-5.6-sol", true, "xhigh", true, "fast", true)).toBe(
+		expect(formatFastModelStatus("gpt-5.6-sol", true, "xhigh", "fast")).toBe("gpt-5.6-sol • xhigh • fast");
+		expect(formatFastModelStatus("gpt-5.6-sol", true, "xhigh", "fast", "paused")).toBe(
 			"gpt-5.6-sol • xhigh • fast • paused",
 		);
-		expect(formatFastModelStatus("gpt-5.6-sol", true, "xhigh", false)).toBe("gpt-5.6-sol • xhigh");
+		expect(formatFastModelStatus("gpt-5.6-sol", true, "xhigh")).toBe("gpt-5.6-sol • xhigh");
 	});
 
 	it("refreshes pi's built-in footer without replacing it", () => {
@@ -214,7 +214,7 @@ describe("Fast footer model status", () => {
 		};
 		const fastMode = new FastModeController(false);
 		fastMode.setSupportedModelIds([model.id]);
-		fastMode.setEnabled(true);
+		fastMode.setPreference(true);
 		const pauseMode = new PauseController(false);
 		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => void>();
 		const pi = {
@@ -252,13 +252,18 @@ describe("Fast footer model status", () => {
 			pauseMode.setEnabled(true);
 			expect(component.render(80)).toEqual([`gpt-5.4 • xhigh • <yellow>fast</yellow> • ${orangePaused}|false`]);
 			pauseMode.setEnabled(false);
-			fastMode.setEnabled(false);
+			fastMode.setPreference("ultrafast");
+			expect(component.render(80)).toEqual(["gpt-5.4 • xhigh • <yellow>Ultra Fast</yellow>|false"]);
+			fastMode.setSupportedModelIds([]);
+			expect(component.render(80)).toEqual(["gpt-5.4|true"]);
+			fastMode.setSupportedModelIds([model.id]);
+			fastMode.setPreference(false);
 			expect(component.render(80)).toEqual(["gpt-5.4|true"]);
 
 			pauseMode.setEnabled(true);
 			expect(component.render(80)).toEqual([`gpt-5.4 • xhigh • ${orangePaused}|false`]);
 			pauseMode.setEnabled(false);
-			fastMode.setEnabled(true);
+			fastMode.setPreference(true);
 			fastMode.setSupportedModelIds([]);
 			expect(component.render(80)).toEqual(["gpt-5.4|true"]);
 
@@ -423,7 +428,7 @@ describe("Fast stream wrapper", () => {
 			captured = options;
 			return streamResult;
 		};
-		const wrapped = wrapStreamSimpleForFast(baseStream, () => false);
+		const wrapped = wrapStreamForServiceTier(baseStream, () => undefined);
 		const options: SimpleStreamOptions = { timeoutMs: 1234 };
 
 		expect(wrapped(model, { messages: [] }, options)).toBe(streamResult);
@@ -438,7 +443,7 @@ describe("Fast stream wrapper", () => {
 			captured = options;
 			return streamResult;
 		};
-		const wrapped = wrapStreamSimpleForFast(baseStream, () => true);
+		const wrapped = wrapStreamForServiceTier(baseStream, () => "priority");
 		const options: SimpleStreamOptions = {
 			timeoutMs: 1234,
 			onPayload: (payload) => {
@@ -459,7 +464,7 @@ describe("Fast stream wrapper", () => {
 describe("Fast payload shaping", () => {
 	it("adds priority without mutating the original payload", () => {
 		const original = { model: "gpt-5.4", service_tier: "default" };
-		const shaped = withPriorityServiceTier(original);
+		const shaped = withServiceTier(original, "priority");
 
 		expect(shaped).toEqual({ model: "gpt-5.4", service_tier: "priority" });
 		expect(original).toEqual({ model: "gpt-5.4", service_tier: "default" });
@@ -467,14 +472,14 @@ describe("Fast payload shaping", () => {
 
 	it("leaves non-object payloads unchanged", () => {
 		const arrayPayload: unknown[] = [];
-		expect(withPriorityServiceTier(null)).toBeNull();
-		expect(withPriorityServiceTier("payload")).toBe("payload");
-		expect(withPriorityServiceTier(arrayPayload)).toBe(arrayPayload);
+		expect(withServiceTier(null, "priority")).toBeNull();
+		expect(withServiceTier("payload", "priority")).toBe("payload");
+		expect(withServiceTier(arrayPayload, "priority")).toBe(arrayPayload);
 	});
 
 	it("lets pi payload hooks inspect and override the injected tier", async () => {
 		let observed: unknown;
-		const result = await applyFastPayloadHook({ model: "gpt-5.4" }, model, (payload) => {
+		const result = await applyServiceTierPayloadHook({ model: "gpt-5.4" }, model, "priority", (payload) => {
 			observed = payload;
 			return { ...(payload as Record<string, unknown>), service_tier: "default" };
 		});
@@ -484,7 +489,7 @@ describe("Fast payload shaping", () => {
 	});
 
 	it("keeps priority when later payload hooks return undefined", async () => {
-		const result = await applyFastPayloadHook({ model: "gpt-5.4" }, model, () => undefined);
+		const result = await applyServiceTierPayloadHook({ model: "gpt-5.4" }, model, "priority", () => undefined);
 		expect(result).toEqual({ model: "gpt-5.4", service_tier: "priority" });
 	});
 });

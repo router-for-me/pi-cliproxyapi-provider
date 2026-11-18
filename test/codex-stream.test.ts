@@ -1182,8 +1182,8 @@ describe("GPT Responses prompt caching", () => {
 		}
 	});
 
-	it("uses the replacement model and keeps existing developers in order after Fast and the caller hook", async () => {
-		const streams = await loadCliproxyCodexStreams(["cliproxyapi"], { shouldUseFast: () => true });
+	it.each(["priority", "ultrafast"] as const)("applies %s before the caller's SSE payload hook", async (tier) => {
+		const streams = await loadCliproxyCodexStreams(["cliproxyapi"], { resolveServiceTier: () => tier });
 		const captured: CapturedRequest[] = [];
 		const leading = [developerItem("first rule"), developerItem("second rule")];
 		const update = developerItem("mid-session rule");
@@ -1195,7 +1195,7 @@ describe("GPT Responses prompt caching", () => {
 					...sseOptions(captured),
 					onPayload: async (payload) => {
 						const body = payload as Record<string, any>;
-						expect(body.service_tier).toBe("priority");
+						expect(body.service_tier).toBe(tier);
 						const [first, second] = body.input;
 						return {
 							...body,
@@ -1560,7 +1560,7 @@ describe("mid-convo effort streams", () => {
 		(globalThis as any).WebSocket = FakeWebSocket;
 		process.env.CLIPROXYAPI_TRANSPORT = "websocket-cached";
 		try {
-			const streams = await loadCliproxyCodexStreams(["cliproxyapi"]);
+			const streams = await loadCliproxyCodexStreams(["cliproxyapi"], { resolveServiceTier: () => "ultrafast" });
 			try {
 				const model = midConvoModel(true);
 				const sessionId = `ws-mid-convo-${Date.now()}`;
@@ -1578,6 +1578,7 @@ describe("mid-convo effort streams", () => {
 					const frame = sentFrames.at(-1)!;
 					expect(frame).not.toHaveProperty("instructions");
 					expect(frame.prompt_cache_key).toBe(sessionId);
+					expect(frame.service_tier).toBe("ultrafast");
 					return frame;
 				};
 

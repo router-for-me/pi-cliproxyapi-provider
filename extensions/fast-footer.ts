@@ -1,6 +1,6 @@
 import { type ExtensionAPI, type ExtensionContext, FooterComponent } from "@earendil-works/pi-coding-agent";
 import type { ProactiveCompactionSettings } from "./auto-compact.ts";
-import type { FastModeController } from "./fast.ts";
+import type { FastModeController, FastServiceTier } from "./fast.ts";
 import { type PauseController, pauseController } from "./pause.ts";
 
 const FAST_FOOTER_PATCH = Symbol.for("@router-for-me/pi-cliproxyapi-provider/fast-footer-patch");
@@ -43,19 +43,17 @@ export function formatFastModelStatus(
 	modelName: string,
 	supportsReasoning: boolean,
 	thinkingLevel: string,
-	fastEnabled: boolean,
-	fastLabel = "fast",
-	paused = false,
-	pausedLabel = "paused",
+	fastLabel?: string,
+	pausedLabel?: string,
 ): string {
 	let status = modelName;
 	if (supportsReasoning) {
 		status += thinkingLevel === "off" ? " • thinking off" : ` • ${thinkingLevel}`;
 	}
-	if (fastEnabled) {
+	if (fastLabel) {
 		status += ` • ${fastLabel}`;
 	}
-	if (paused) {
+	if (pausedLabel) {
 		status += ` • ${pausedLabel}`;
 	}
 	return status;
@@ -96,13 +94,13 @@ function installFooterPatch(controller: FastFooterController): void {
 				const originalId = model.id;
 				const originalReasoning = model.reasoning;
 				const originalContextWindow = model.contextWindow;
-				const fastEnabled = activeController.isEffectiveFor(model);
-				if (fastEnabled || activeController.isPaused()) {
+				const tier = activeController.getServiceTierFor(model);
+				if (tier || activeController.isPaused()) {
 					model.id = activeController.formatModelStatus(
 						originalId,
 						originalReasoning,
 						session?.state.thinkingLevel ?? "off",
-						fastEnabled,
+						tier,
 					);
 					model.reasoning = false;
 				}
@@ -138,7 +136,7 @@ function removeFooterPatch(controller: FastFooterController): void {
 	delete prototype[FAST_FOOTER_PATCH];
 }
 
-/** Adds Fast to pi's built-in model status without replacing the footer. */
+/** Adds the active speed label to pi's built-in model status without replacing the footer. */
 export class FastFooterController {
 	private activeContext: ExtensionContext | undefined;
 	private patchInstalled = false;
@@ -166,27 +164,25 @@ export class FastFooterController {
 		});
 	}
 
-	formatModelStatus(modelName: string, supportsReasoning: boolean, thinkingLevel: string, fastEnabled = true): string {
+	formatModelStatus(
+		modelName: string,
+		supportsReasoning: boolean,
+		thinkingLevel: string,
+		tier?: FastServiceTier,
+	): string {
 		const theme = this.activeContext?.ui.theme;
-		const fastLabel = theme?.fg("warning", "fast") ?? "fast";
-		const pausedLabel = formatOrangeLabel(theme, "paused");
-		return formatFastModelStatus(
-			modelName,
-			supportsReasoning,
-			thinkingLevel,
-			fastEnabled,
-			fastLabel,
-			this.pauseMode.isEnabled(),
-			pausedLabel,
-		);
+		const label = tier === "ultrafast" ? "Ultra Fast" : "fast";
+		const fastLabel = tier ? (theme?.fg("warning", label) ?? label) : undefined;
+		const pausedLabel = this.isPaused() ? formatOrangeLabel(theme, "paused") : undefined;
+		return formatFastModelStatus(modelName, supportsReasoning, thinkingLevel, fastLabel, pausedLabel);
 	}
 
 	isProviderModel(model: MutableModel): boolean {
 		return model.provider === this.providerId;
 	}
 
-	isEffectiveFor(model: MutableModel): boolean {
-		return this.isProviderModel(model) && this.fastMode.isEffectiveFor(model.id);
+	getServiceTierFor(model: MutableModel): FastServiceTier | undefined {
+		return this.isProviderModel(model) ? this.fastMode.getServiceTierFor(model.id) : undefined;
 	}
 
 	isPaused(): boolean {

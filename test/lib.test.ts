@@ -537,9 +537,13 @@ describe("config and auth file helpers", () => {
 		try {
 			delete process.env.CLIPROXYAPI_FAST;
 			expect(resolveFastDefault(agentDir)).toBe(true);
+			saveConfigFile(agentDir, { fast: "ultrafast" });
+			expect(resolveFastDefault(agentDir)).toBe("ultrafast");
+			process.env.CLIPROXYAPI_FAST = "on";
+			expect(resolveFastDefault(agentDir)).toBe(true);
 			process.env.CLIPROXYAPI_FAST = "off";
 			expect(resolveFastDefault(agentDir)).toBe(false);
-			process.env.CLIPROXYAPI_FAST = "invalid";
+			process.env.CLIPROXYAPI_FAST = "ultrafast";
 			expect(() => resolveFastDefault(agentDir)).toThrow(/CLIPROXYAPI_FAST/);
 		} finally {
 			if (previous === undefined) {
