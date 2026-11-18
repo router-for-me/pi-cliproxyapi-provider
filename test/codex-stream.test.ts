@@ -2,8 +2,11 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
+import type { Context, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	adaptContextForModule,
+	adaptTranscriptContext,
 	computePatchedModuleCachePath,
 	hasNativeMidConvoEffort,
 	loadCliproxyCodexStreams,
@@ -785,6 +788,10 @@ function userMessage(text: string): any {
 	return { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
 }
 
+function developerItem(text: string) {
+	return { type: "message", role: "developer", content: [{ type: "input_text", text }] };
+}
+
 function configurationUpdates(body: Record<string, any>): string[] {
 	const input = Array.isArray(body.input) ? body.input : [];
 	return input.filter((item: any) => item?.type === "configuration_update").map((item: any) => item.reasoning?.effort);
@@ -1131,6 +1138,205 @@ describe("reshapeConfigurationUpdates", () => {
 	});
 });
 
+describe("GPT Responses prompt caching", () => {
+	const systemPrompt = "  Follow the project's rules.\n\n";
+	const sseOptions = (captured: CapturedRequest[]): SimpleStreamOptions => ({
+		apiKey: "sk-test",
+		transport: "sse",
+		fetch: cannedSseFetch(captured),
+		sessionId: "gpt-prompt-test",
+	});
+
+	it.each([
+		{ id: "  GpT-6-sol  ", prompt: systemPrompt, developer: systemPrompt },
+		{ id: "gpt-6-sol", prompt: " \n\t", developer: "You are a helpful assistant." },
+		{ id: "custom-gpt-6-sol", prompt: systemPrompt, developer: undefined },
+	])("serializes the base prompt for $id", async ({ id, prompt, developer }) => {
+		const streams = await loadCliproxyCodexStreams();
+		const captured: CapturedRequest[] = [];
+		const result = await streams
+			.streamSimple(
+				{ ...midConvoModel(false), id },
+				{
+					systemPrompt: prompt,
+					messages: [userMessage("question")],
+					tools: [{ name: "read", description: "Read a file", parameters: { type: "object", properties: {} } }],
+				},
+				sseOptions(captured),
+			)
+			.result();
+
+		expect(result.errorMessage).toBeUndefined();
+		expect(captured).toHaveLength(1);
+		const { body } = captured[0];
+		expect(body.model).toBe(id);
+		expect(body.prompt_cache_key).toBe("gpt-prompt-test");
+		expect(body.tools).toEqual([expect.objectContaining({ type: "function", name: "read" })]);
+		const user = { role: "user", content: [{ type: "input_text", text: "question" }] };
+		if (developer === undefined) {
+			expect(body.instructions).toBe(prompt);
+			expect(body.input).toEqual([user]);
+		} else {
+			expect(body).not.toHaveProperty("instructions");
+			expect(body.input).toEqual([developerItem(developer), user]);
+		}
+	});
+
+	it("uses the replacement model and keeps existing developers in order after Fast and the caller hook", async () => {
+		const streams = await loadCliproxyCodexStreams(["cliproxyapi"], { shouldUseFast: () => true });
+		const captured: CapturedRequest[] = [];
+		const leading = [developerItem("first rule"), developerItem("second rule")];
+		const update = developerItem("mid-session rule");
+		const result = await streams
+			.stream(
+				{ ...midConvoModel(false), id: "other-model" },
+				{ messages: [userMessage("first"), userMessage("second")] },
+				{
+					...sseOptions(captured),
+					onPayload: async (payload) => {
+						const body = payload as Record<string, any>;
+						expect(body.service_tier).toBe("priority");
+						const [first, second] = body.input;
+						return {
+							...body,
+							model: "gpt-hook-model",
+							instructions: systemPrompt,
+							service_tier: "default",
+							input: [...leading, first, update, second],
+						};
+					},
+				},
+			)
+			.result();
+
+		expect(result.errorMessage).toBeUndefined();
+		const { body } = captured[0];
+		expect(body.model).toBe("gpt-hook-model");
+		expect(body.service_tier).toBe("default");
+		expect(body).not.toHaveProperty("instructions");
+		expect(body.input).toEqual([
+			developerItem(systemPrompt),
+			...leading,
+			{ role: "user", content: [{ type: "input_text", text: "first" }] },
+			update,
+			{ role: "user", content: [{ type: "input_text", text: "second" }] },
+		]);
+	});
+
+	it("restores the base prompt before an existing transcript developer message when a hook deletes instructions", async () => {
+		const streams = await loadCliproxyCodexStreams();
+		const captured: CapturedRequest[] = [];
+		const extra = "Keep answers concise.";
+		const result = await streams
+			.rawStreamSimple(
+				{ ...midConvoModel(false), compat: { supportsMidConvoSystemMessages: true } },
+				{
+					messages: [
+						{ ...systemMessage(), content: systemPrompt },
+						{ ...systemMessage(), content: extra },
+						userMessage("question"),
+					],
+				},
+				{
+					...sseOptions(captured),
+					onPayload: (payload) => {
+						const body = payload as Record<string, any>;
+						delete body.instructions;
+						return { ...body, input: body.input.map((item: object) => ({ ...item })) };
+					},
+				},
+			)
+			.result();
+
+		expect(result.errorMessage).toBeUndefined();
+		const { body } = captured[0];
+		expect(body).not.toHaveProperty("instructions");
+		expect(body.input).toEqual([
+			developerItem(systemPrompt),
+			{ role: "developer", content: extra },
+			{ role: "user", content: [{ type: "input_text", text: "question" }] },
+		]);
+	});
+
+	const additionalTools = { type: "additional_tools", role: "developer", tools: [] };
+	const explicitDeveloper = developerItem(systemPrompt);
+	const implicitDeveloper = { role: "developer", content: systemPrompt };
+	it.each([
+		{ name: "instructions are deleted", remove: true, prefix: [], expected: [developerItem(systemPrompt)] },
+		{
+			name: "instructions are unset and a developer-role tool item leads",
+			prefix: [additionalTools],
+			expected: [developerItem(systemPrompt), additionalTools],
+		},
+		{
+			name: "the base is moved to a typed developer message",
+			prefix: [explicitDeveloper],
+			expected: [explicitDeveloper],
+		},
+		{
+			name: "the base is moved to an untyped developer message",
+			prefix: [implicitDeveloper],
+			expected: [implicitDeveloper],
+		},
+	])("preserves a base prompt after an in-place hook when $name", async ({ remove, prefix, expected }) => {
+		const streams = await loadCliproxyCodexStreams();
+		const captured: CapturedRequest[] = [];
+		const result = await streams
+			.rawStreamSimple(
+				midConvoModel(false),
+				{ systemPrompt, messages: [userMessage("question")] },
+				{
+					...sseOptions(captured),
+					onPayload: (payload) => {
+						const body = payload as Record<string, any>;
+						if (remove) delete body.instructions;
+						else body.instructions = undefined;
+						body.input.unshift(...prefix);
+					},
+				},
+			)
+			.result();
+
+		expect(result.errorMessage).toBeUndefined();
+		const { body } = captured[0];
+		expect(body).not.toHaveProperty("instructions");
+		expect(body.input).toEqual([...expected, { role: "user", content: [{ type: "input_text", text: "question" }] }]);
+	});
+
+	it("keeps text input supplied by a raw stream payload hook", async () => {
+		const streams = await loadCliproxyCodexStreams();
+		const captured: CapturedRequest[] = [];
+		const result = await streams
+			.rawStream(
+				midConvoModel(false),
+				{ messages: [] },
+				{
+					...sseOptions(captured),
+					onPayload: (payload) => ({ ...(payload as object), instructions: systemPrompt, input: "question" }),
+				},
+			)
+			.result();
+
+		expect(result.errorMessage).toBeUndefined();
+		const { body } = captured[0];
+		expect(body).not.toHaveProperty("instructions");
+		expect(body.input).toEqual([
+			developerItem(systemPrompt),
+			{ role: "user", content: [{ type: "input_text", text: "question" }] },
+		]);
+	});
+
+	it("can recover verbatim legacy text without changing the classic adaptation", () => {
+		const context = {
+			messages: [
+				{ ...systemMessage(), content: [{ type: "text", text: systemPrompt }], sections: { rule: " rule " } },
+			],
+		};
+		expect(adaptContextForModule(context, false).systemPrompt).toBe("Follow the project's rules.\n\nrule");
+		expect(adaptTranscriptContext(context, true).systemPrompt).toBe(`${systemPrompt}\n\n rule `);
+	});
+});
+
 describe("mid-convo effort streams", () => {
 	it("promotes the first effort to the request level and keeps later changes before their user message", async () => {
 		const streams = await loadCliproxyCodexStreams(["cliproxyapi"]);
@@ -1293,7 +1499,7 @@ describe("mid-convo effort streams", () => {
 		expect(configurationUpdates(captured[0].body)).toEqual([]);
 	});
 
-	it("keeps websocket cached continuation across a thinking level change", async () => {
+	it("continues websocket on reasoning changes but resends full input on a developer prompt or model change", async () => {
 		const sentFrames: Array<Record<string, any>> = [];
 		let connections = 0;
 		class FakeWebSocket extends EventTarget {
@@ -1358,41 +1564,53 @@ describe("mid-convo effort streams", () => {
 			try {
 				const model = midConvoModel(true);
 				const sessionId = `ws-mid-convo-${Date.now()}`;
-				const first = await streams
-					.streamSimple(model, { messages: [systemMessage(), userMessage("first question")] }, {
-						apiKey: "sk-test",
-						reasoning: "low",
-						sessionId,
-					} as any)
-					.result();
+				const history: Context["messages"] = [];
+				let prompt = "You are a test harness.";
+				const turn = async (question: string, reasoning: "low" | "high", turnModel = model) => {
+					history.push(userMessage(question));
+					const context = { systemPrompt: prompt, messages: history };
+					const result = await streams
+						.streamSimple(turnModel, context, { apiKey: "sk-test", sessionId, reasoning })
+						.result();
+					expect(result.errorMessage).toBeUndefined();
+					expect(result.providerThinkingLevel).toBe(reasoning);
+					history.push(result);
+					const frame = sentFrames.at(-1)!;
+					expect(frame).not.toHaveProperty("instructions");
+					expect(frame.prompt_cache_key).toBe(sessionId);
+					return frame;
+				};
 
-				expect(first.errorMessage).toBeUndefined();
-				expect(first.providerThinkingLevel).toBe("low");
-				expect(sentFrames).toHaveLength(1);
-				expect(sentFrames[0].type).toBe("response.create");
-				expect(sentFrames[0].reasoning?.effort).toBe("low");
-				expect(configurationUpdates(sentFrames[0])).toEqual([]);
-				expect(sentFrames[0].previous_response_id).toBeUndefined();
+				const first = await turn("first question", "low");
+				expect(first.type).toBe("response.create");
+				expect(first.reasoning?.effort).toBe("low");
+				expect(configurationUpdates(first)).toEqual([]);
+				expect(first).not.toHaveProperty("previous_response_id");
+				expect(first.input[0]).toEqual(developerItem(prompt));
+				expect(wireUserItemIndex(first, "first question")).toBe(1);
 
-				const second = await streams
-					.streamSimple(
-						model,
-						{ messages: [systemMessage(), userMessage("first question"), first, userMessage("second question")] },
-						{ apiKey: "sk-test", reasoning: "high", sessionId } as any,
-					)
-					.result();
+				const second = await turn("second question", "high");
+				expect(second.previous_response_id).toBe("resp_ws_1");
+				expect(second.reasoning?.effort).toBe("low");
+				expect(second.input).toHaveLength(2);
+				expect(configurationUpdates(second)).toEqual(["high"]);
+				expect(wireUserItemIndex(second, "second question")).toBe(1);
 
-				expect(second.errorMessage).toBeUndefined();
-				expect(second.providerThinkingLevel).toBe("high");
+				prompt = "A changed base prompt.";
+				const third = await turn("third question", "high");
+				const fourth = await turn("fourth question", "high", { ...model, id: "gpt-other-model" });
+				expect(fourth.model).toBe("gpt-other-model");
+				for (const [frame, latestQuestion] of [
+					[third, "third question"],
+					[fourth, "fourth question"],
+				] as const) {
+					expect(frame).not.toHaveProperty("previous_response_id");
+					expect(frame.input[0]).toEqual(developerItem(prompt));
+					expect(wireUserItemIndex(frame, "first question")).toBe(1);
+					expect(wireUserItemIndex(frame, latestQuestion)).toBe(frame.input.length - 1);
+				}
+				expect(sentFrames).toHaveLength(4);
 				expect(connections).toBe(1);
-				expect(sentFrames).toHaveLength(2);
-				expect(sentFrames[1].previous_response_id).toBe("resp_ws_1");
-				expect(sentFrames[1].reasoning?.effort).toBe("low");
-				expect(configurationUpdates(sentFrames[1])).toEqual(["high"]);
-				const updateIndex = configurationUpdateIndices(sentFrames[1])[0];
-				expect(wireUserItemIndex(sentFrames[1], "second question")).toBe(updateIndex + 1);
-				expect(JSON.stringify(sentFrames[1].input)).toContain("second question");
-				expect(JSON.stringify(sentFrames[1].input)).not.toContain("first question");
 			} finally {
 				streams.closeOpenAICodexWebSocketSessions();
 			}

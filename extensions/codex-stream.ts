@@ -6,6 +6,7 @@
  * - chatgpt-account-id header is omitted when account id is unavailable
  * - provider id(s) are added to CODEX_TOOL_CALL_PROVIDERS for tool-call id handling
  * - model/message api id uses cliproxyapi-codex-responses
+ * - GPT base instructions become the first developer input item
  *
  * The patched module is derived at runtime from the installed
  * @earendil-works/pi-ai openai-codex-responses implementation so we track
@@ -55,14 +56,17 @@ interface TranscriptMessage {
 	[key: string]: unknown;
 }
 
-function extractContentText(content: unknown): string {
-	if (typeof content === "string") return content.trim();
+function isGptModelId(id: unknown): boolean {
+	return typeof id === "string" && id.trim().toLowerCase().startsWith("gpt-");
+}
+
+function extractContentText(content: unknown, preserveWhitespace: boolean): string {
+	if (typeof content === "string") return preserveWhitespace ? content : content.trim();
 	if (Array.isArray(content)) {
-		return content
+		const parts = content
 			.filter((b) => b && typeof b === "object" && b.type === "text" && typeof b.text === "string")
-			.map((b) => b.text.trim())
-			.filter(Boolean)
-			.join("\n");
+			.map((b) => b.text as string);
+		return (preserveWhitespace ? parts : parts.map((text) => text.trim()).filter(Boolean)).join("\n");
 	}
 	return "";
 }
@@ -75,7 +79,10 @@ function extractContentText(content: unknown): string {
  * Classic openai-codex-responses expects context.systemPrompt and context.tools, and fails when
  * encountering system messages inside context.messages during token estimation or payload generation.
  */
-export function adaptTranscriptContext(context: Context | { messages?: unknown[]; [key: string]: unknown }): Context {
+export function adaptTranscriptContext(
+	context: Context | { messages?: unknown[]; [key: string]: unknown },
+	preserveSystemWhitespace = false,
+): Context {
 	if (!context || !Array.isArray(context.messages)) {
 		return context as Context;
 	}
@@ -105,7 +112,7 @@ export function adaptTranscriptContext(context: Context | { messages?: unknown[]
 		if (!msg || typeof msg !== "object") continue;
 
 		if (msg.role === "system") {
-			const text = extractContentText(msg.content);
+			const text = extractContentText(msg.content, preserveSystemWhitespace);
 			if (text) {
 				leadingText = leadingText ? `${leadingText}\n\n${text}` : text;
 			}
@@ -113,8 +120,9 @@ export function adaptTranscriptContext(context: Context | { messages?: unknown[]
 				for (const [name, sectionText] of Object.entries(msg.sections)) {
 					if (sectionText === null || sectionText === undefined) {
 						sections.delete(name);
-					} else if (typeof sectionText === "string" && sectionText.trim()) {
-						sections.set(name, sectionText.trim());
+					} else if (typeof sectionText === "string") {
+						const section = preserveSystemWhitespace ? sectionText : sectionText.trim();
+						if (section) sections.set(name, section);
 					}
 				}
 			}
@@ -192,6 +200,52 @@ export function adaptContextForModule(
 	supportsTranscript: boolean,
 ): Context {
 	return supportsTranscript ? ensureTranscriptContext(context) : adaptTranscriptContext(context);
+}
+
+function matchesInputText(content: unknown, text: string): boolean {
+	if (typeof content === "string") return content === text;
+	return (
+		Array.isArray(content) &&
+		content.every((part) => part?.type === "input_text" && typeof part.text === "string") &&
+		content.map((part) => part.text).join("") === text
+	);
+}
+
+function moveGptInstructionsToInput(
+	body: Record<string, unknown>,
+	builtInstructions: unknown,
+	legacyContext?: Context,
+): Record<string, unknown> {
+	if (!isGptModelId(body.model)) return body;
+
+	const { input, instructions, ...rest } = body;
+	if (input !== undefined && typeof input !== "string" && !Array.isArray(input)) return body;
+	const messages =
+		typeof input === "string" ? [{ role: "user", content: [{ type: "input_text", text: input }] }] : (input ?? []);
+	let prompt = instructions === undefined ? builtInstructions : instructions;
+	if (legacyContext && (instructions === undefined || instructions === builtInstructions)) {
+		// Recover whitespace only for the outgoing GPT prompt, not the classic context or hook replacements.
+		const legacyPrompt = adaptTranscriptContext(legacyContext, true).systemPrompt;
+		if (legacyPrompt?.trim()) prompt = legacyPrompt;
+	}
+	const text = typeof prompt === "string" && prompt.trim() ? prompt : "You are a helpful assistant.";
+
+	// An unrelated leading developer message must not replace the base prompt.
+	const first = messages[0];
+	if (
+		instructions === undefined &&
+		first?.role === "developer" &&
+		(first.type === undefined || first.type === "message") &&
+		(typeof first.content === "string" || Array.isArray(first.content)) &&
+		(builtInstructions === undefined || matchesInputText(first.content, text))
+	) {
+		return body;
+	}
+
+	return {
+		...rest,
+		input: [{ type: "message", role: "developer", content: [{ type: "input_text", text }] }, ...messages],
+	};
 }
 
 export function withPriorityServiceTier(payload: unknown): unknown {
@@ -1413,25 +1467,30 @@ export async function loadCliproxyCodexStreams(
 	// follows pi's converter layout; reshape payloads to the documented layout
 	// in the wrapper instead of inside the patched module.
 	const nativeMidConvoEffort = hasNativeMidConvoEffort(originalSource);
-	const adaptOptions = (streamOptions?: SimpleStreamOptions): SimpleStreamOptions | undefined => {
-		if (!nativeMidConvoEffort) {
-			return streamOptions;
-		}
-		return {
-			...streamOptions,
-			onPayload: async (payload, payloadModel) => {
-				const nextPayload = await streamOptions?.onPayload?.(payload, payloadModel);
-				const effective = (nextPayload === undefined ? payload : nextPayload) as Record<string, unknown>;
-				return effective && typeof effective === "object" ? reshapeConfigurationUpdates(effective) : effective;
-			},
-		};
-	};
+	const adaptOptions = (context: Context, streamOptions?: SimpleStreamOptions): SimpleStreamOptions => ({
+		...streamOptions,
+		onPayload: async (payload, payloadModel) => {
+			const builtInstructions =
+				payload && typeof payload === "object" && "instructions" in payload ? payload.instructions : undefined;
+			const nextPayload = await streamOptions?.onPayload?.(payload, payloadModel);
+			const effective = nextPayload === undefined ? payload : nextPayload;
+			if (!effective || typeof effective !== "object" || Array.isArray(effective)) return effective;
+
+			const body = effective as Record<string, unknown>;
+			// Prefix the final full body before either transport, including WebSocket delta detection.
+			return moveGptInstructionsToInput(
+				nativeMidConvoEffort ? reshapeConfigurationUpdates(body) : body,
+				builtInstructions,
+				supportsTranscript ? undefined : context,
+			);
+		},
+	});
 
 	const adaptedStreamSimple: CliproxyCodexStreamSimple = (model, context, streamOptions) => {
-		return mod.streamSimple(adaptModel(model), adaptContext(context), adaptOptions(streamOptions));
+		return mod.streamSimple(adaptModel(model), adaptContext(context), adaptOptions(context, streamOptions));
 	};
 	const adaptedStream: CliproxyCodexStreamSimple = (model, context, streamOptions) => {
-		return mod.stream(adaptModel(model), adaptContext(context), adaptOptions(streamOptions));
+		return mod.stream(adaptModel(model), adaptContext(context), adaptOptions(context, streamOptions));
 	};
 
 	const streamSimple = wrapStreamSimpleForFast(adaptedStreamSimple, options.shouldUseFast);
